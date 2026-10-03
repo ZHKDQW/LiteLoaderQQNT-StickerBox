@@ -5,7 +5,7 @@
     "name": "本地表情包库",
     "slug": "sticker_box",
     "description": "把聊天里的表情/图片一键存进本地表情库，点工具栏星标随时调出；点击填入输入框，拖拽可保留动图",
-    "version": "0.1.0",
+    "version": "0.1.1",
     "icon": "./assets/icon.svg",
     "thumb": "./assets/icon.svg",
     "authors": [
@@ -28,7 +28,7 @@
         "repo": "ZHKDQW/LiteLoaderQQNT-StickerBox",
         "branch": "main",
         "release": {
-            "tag": "0.1.0",
+            "tag": "0.1.1",
             "file": "StickerBox.zip"
         }
     }

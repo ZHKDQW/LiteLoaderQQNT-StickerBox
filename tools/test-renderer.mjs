@@ -316,6 +316,49 @@ if (injected) {
     console.log("      菜单现有内容: " + menu.innerHTML.slice(0, 200));
 }
 
+console.log("\n== 3b) 大表情（data: URI）不会被原样写进日志 ==");
+try {
+    // QQ 的「大表情」/收藏表情是内联 base64。0.1.0 会把整条 data: URI
+    // 写进日志 —— 单行 386,862 字符，主进程同步写盘时卡住（托盘都会没反应）。
+    const bigDataUri = "data:image/png;base64," + "A".repeat(200000);
+    const holder = doc.createElement("div");
+    holder.className = "msg-content-container message";
+    holder.innerHTML = `<img class="marketface" src="${bigDataUri}">`;
+    setRect(holder, 150, 200, 300, 200);
+    doc.body.appendChild(holder);
+
+    const mark = logLines.length;
+    // 让菜单强制重建：先移除再右键
+    menu.remove();
+    const menu2 = doc.createElement("div");
+    menu2.className = "q-context-menu";
+    menu2.innerHTML = `<a class="q-context-menu-item"><span class="q-context-menu-item__text">复制</span></a>`;
+    setRect(menu2, 500, 400, 160, 120); // 菜单要"可见"（>20x20），但别盖住点击点，否则 elementFromPoint 会命中菜单而不是图片
+    doc.body.appendChild(menu2);
+
+    const img2 = holder.querySelector("img");
+    setRect(img2, 150, 200, 200, 200); // elementFromPoint 要能命中它
+    // 按真实流程来：QQ 里是「右键 mousedown → contextmenu」。
+    // 只发 contextmenu 的话，插件会沿用上一次残留的 ctxTarget（contextmenu 处理器
+    // 只在 ctxTarget 为空时才更新），测出来就不是这张图了。
+    img2.dispatchEvent(new window.MouseEvent("mousedown", { bubbles: true, button: 2, clientX: 200, clientY: 260 }));
+    img2.dispatchEvent(new window.MouseEvent("contextmenu", { bubbles: true, button: 2, clientX: 200, clientY: 260 }));
+    await sleep(300);
+
+    const produced = logLines.slice(mark);
+    produced.length ? ok(`右键大表情产生了 ${produced.length} 行日志`) : bad("右键大表情没有产生日志（用例无效）");
+    const longest = produced.reduce((a, b) => (a.length > b.length ? a : b), "");
+    longest.length < 2000
+        ? ok(`最长一行只有 ${longest.length} 字符（不再把 200KB 的 base64 写进日志）`)
+        : bad(`日志行长达 ${longest.length} 字符，data: URI 又漏出来了`);
+    produced.some((l) => l.includes("data-uri(")) ? ok("data: URI 被压成了摘要，形如 data-uri(image/png,195KB)") : (bad("没有看到 data-uri 摘要"), console.log("      [调试] 实际日志: " + produced.join(" || ").slice(0, 400)));
+    !produced.some((l) => l.includes("AAAAA")) ? ok("日志里不含 base64 正文") : bad("日志里仍然带着 base64 正文");
+    holder.remove();
+    menu2.remove();
+} catch (e) {
+    bad("3b 抛异常: " + e.message);
+}
+
 console.log("\n== 4) 表情面板入口已按要求移除 ==");
 try {
     // 塞一个和 QQ 表情面板一模一样的结构进去 —— 插件也绝不该往里插任何东西
@@ -507,6 +550,18 @@ try {
         : ok("工具栏星标当前不在 .func-bar 内（可能被开关摘掉了）");
 } catch (e) {
     bad("12c 抛异常: " + e.message);
+}
+
+// 12d: 全局不变式 —— 整个测试期间产生的所有日志行都不许超长。
+//      这条比单点用例更强：以后任何地方不小心把大对象写进日志，这里都会红。
+try {
+    const worst = logLines.reduce((a, b) => (a.length > b.length ? a : b), "");
+    const over = logLines.filter((l) => l.length > 2000);
+    over.length === 0
+        ? ok(`全部 ${logLines.length} 行日志都不超长（最长 ${worst.length} 字符）`)
+        : bad(`${over.length} 行日志超过 2000 字符，最长 ${worst.length} 字符`);
+} catch (e) {
+    bad("12d 抛异常: " + e.message);
 }
 
 console.log(`\n================ 结果: ${pass} 通过 / ${fail} 失败 ================`);

@@ -98,7 +98,13 @@ for (const name of used) {
 
 console.log("== 6/6 main 里的 ipcMain.handle ==");
 const mainSrc = fs.readFileSync(mainJs, "utf8");
-const handled = new Set([...mainSrc.matchAll(/ipcMain\.handle\(\s*CH\(\s*"([^"]+)"\s*\)/g)].map((m) => m[1]));
+// main.js 里 handler 的两种写法都要认：
+//   1) ipcMain.handle(CH("x"), ...)                      —— 直接注册
+//   2) handle("x", ...)                                  —— 走带计时的统一包装
+const handled = new Set([
+    ...[...mainSrc.matchAll(/ipcMain\.handle\(\s*CH\(\s*"([^"]+)"\s*\)/g)].map((m) => m[1]),
+    ...[...mainSrc.matchAll(/(?:^|[^.\w])handle\(\s*"([^"]+)"\s*,/g)].map((m) => m[1])
+]);
 for (const name of exposed) {
     handled.has(name) ? ok(`handler: ${name}`) : bad(`preload 暴露了 ${name}，但 main 里没有 ipcMain.handle`);
 }

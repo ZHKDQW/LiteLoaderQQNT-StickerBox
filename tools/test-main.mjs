@@ -59,6 +59,8 @@ const CH = (m) => `LiteLoader.sticker_box.${m}`;
 // 传一个带 sender 的假事件对象 —— main.js 现在优先用 event.sender（Electron 官方做法）
 const call = (m, ...args) => H.get(CH(m))({ sender: globalThis.__mock.sender }, ...args);
 
+const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
+
 // ---- 断言工具 ----
 let pass = 0;
 let fail = 0;
@@ -308,6 +310,78 @@ if (fs.existsSync(logFile)) {
     ok("debug.log 有 " + lines.length + " 行");
     lines.slice(0, 3).forEach((l) => console.log("      " + l.slice(0, 140)));
 } else bad("debug.log 没生成");
+
+console.log("\n== 16) 日志安全阀（0.1.1 修的 bug：右键大表情写出过 386KB 单行） ==");
+{
+    const sizeBefore = fs.statSync(logFile).size;
+
+    // 模拟 QQ 把整张图片内联成 data: URI —— 当初就是它被原样写进了日志
+    const huge = "data:image/png;base64," + "A".repeat(400000);
+    await call("log", "超长内容测试 " + huge);
+    await sleep(150);
+
+    const lines = fs.readFileSync(logFile, "utf8").trim().split("\n");
+    const last = lines[lines.length - 1];
+
+    last.length < 2000
+        ? ok(`400KB 的内容被截断成 ${last.length} 字符的日志行（旧版会写出 386,862 字符）`)
+        : bad(`日志行仍然有 ${last.length} 字符，截断没生效`);
+    /已截断/.test(last) ? ok("截断处有明确标注和原始长度") : bad("截断没有标注");
+
+    // data: URI 本身要能认出来（要单独传，前面拼了别的内容就匹配不到 ^data:）
+    await call("log", huge);
+    await sleep(150);
+    const uriLine = fs.readFileSync(logFile, "utf8").trim().split("\n").pop();
+    /data URI/.test(uriLine) ? ok("认得这是 data URI 并特别标注") : bad("没识别出 data URI: " + uriLine.slice(0, 120));
+
+    const grew = fs.statSync(logFile).size - sizeBefore;
+    grew < 4000 ? ok(`本次日志只增长 ${grew} 字节（旧版会涨 386KB）`) : bad(`日志增长了 ${grew} 字节，还是太多`);
+
+    // 整行上限：多个超长参数拼起来也不能突破
+    await call("log", huge, huge, huge);
+    await sleep(150);
+    const after = fs.readFileSync(logFile, "utf8").trim().split("\n").pop();
+    after.length <= 8100 ? ok(`整行上限生效（${after.length} 字符）`) : bad(`整行上限失效: ${after.length} 字符`);
+}
+
+console.log("\n== 17) data: URI 能存进库（QQ 大表情没有本地文件可复制） ==");
+{
+    const png = fs.readFileSync(path.join(HERE, "..", "assets", "drag-icon.png"));
+    const dataUri = "data:image/png;base64," + png.toString("base64");
+
+    const res = await call("saveCandidates", { candidates: [dataUri], context: {} });
+    res && res.ok ? ok("data: URI 解码后成功入库") : bad("data: URI 存不进去: " + JSON.stringify(res));
+
+    const listed = await call("list", "");
+    const items = Array.isArray(listed) ? listed : [];
+    const hit = items.find((i) => /marketface/.test(i.name));
+    if (hit) {
+        const got = await call("readFile", hit.name);
+        const buf = Buffer.from(got.buffer);
+        buf.length === png.length ? ok(`入库文件大小一致（${buf.length} 字节）`) : bad(`大小不一致: ${buf.length} vs ${png.length}`);
+        buf.equals(png) ? ok("字节内容与原图完全一致（base64 解码正确）") : bad("字节内容不一致");
+    } else {
+        bad("没找到入库的 marketface 文件，现有: " + items.map((i) => i.name).join(","));
+    }
+
+    const badUri = await call("saveCandidates", { candidates: ["data:image/png;base64,!!!!"], context: {} });
+    badUri && typeof badUri === "object" ? ok("非法 data: URI 被安全处理，没有抛异常") : bad("非法 data: URI 处理异常");
+}
+
+console.log("\n== 18) 看门狗与计时（为下一次定位卡死准备） ==");
+{
+    const mainSrc = fs.readFileSync(PLUGIN_MAIN, "utf8");
+    /startWatchdog\(\);/.test(mainSrc) ? ok("main.js 启动了主进程看门狗") : bad("main.js 没有看门狗");
+    /事件循环被阻塞/.test(mainSrc) ? ok("看门狗会记录阻塞时长与内存") : bad("看门狗没有记录阻塞");
+    /\[慢\] IPC/.test(mainSrc) ? ok("IPC handler 有慢调用计时") : bad("IPC handler 没有计时");
+    /startDrag: 开始/.test(mainSrc) && /startDrag: 结束/.test(mainSrc)
+        ? ok("startDrag 有前后标记（能查出它是否卡住不返回）")
+        : bad("startDrag 缺少前后标记");
+
+    const rendererSrc = fs.readFileSync(path.join(HERE, "..", "renderer.js"), "utf8");
+    /主线程被阻塞/.test(rendererSrc) ? ok("renderer.js 里也有看门狗") : bad("renderer.js 没有看门狗");
+    /summarizeSource/.test(rendererSrc) ? ok("候选地址在送进日志前会被压成摘要") : bad("候选地址没有摘要化");
+}
 
 console.log(`\n================ 结果: ${pass} 通过 / ${fail} 失败 ================`);
 process.exit(fail ? 1 : 0);

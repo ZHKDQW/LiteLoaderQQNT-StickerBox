@@ -60,13 +60,52 @@ let panelEl = null;
 let panelAnchor = null;
 let toastEl = null;
 
+/**
+ * 日志安全阀（渲染进程侧）。
+ *
+ * 【踩过的坑】右键大表情时 QQ 用 data: URI 内联整张图片，候选列表被原样
+ * JSON.stringify 后经 IPC 送给主进程落盘 —— 单行 386,862 字符，
+ * 3 行日志就有 1.13 MB。既白占磁盘，又让主进程同步写盘时卡住（托盘都会没反应）。
+ *
+ * 所以在**送出去之前**就截断：既省 IPC 流量，也省主进程的内存和磁盘。
+ */
+const LOG_MAX_VALUE = 300;
+
+function clipValue(v) {
+    let s;
+    if (typeof v === "string") s = v;
+    else if (v instanceof Error) s = v.stack || String(v);
+    else {
+        try {
+            s = JSON.stringify(v);
+        } catch (e) {
+            s = String(v);
+        }
+    }
+    if (typeof s !== "string") s = String(s);
+    if (s.length <= LOG_MAX_VALUE) return s;
+    const tag = /^data:/i.test(s) ? "data URI" : "长内容";
+    return `${s.slice(0, LOG_MAX_VALUE)}…[${tag}已截断，原长 ${s.length} 字符]`;
+}
+
 const log = (...args) => {
     try {
-        api.log(args.map((a) => (typeof a === "string" ? a : JSON.stringify(a))).join(" "));
+        api.log(args.map(clipValue).join(" "));
     } catch (e) {
         /* ignore */
     }
 };
+
+/** 把候选地址压成一行摘要：data: URI 只记类型和长度，绝不整条打出来 */
+function summarizeSource(u) {
+    const s = String(u || "");
+    if (/^data:/i.test(s)) {
+        const m = /^data:([^;,]+)/i.exec(s);
+        return `data-uri(${m ? m[1] : "?"},${Math.round(s.length / 1024)}KB)`;
+    }
+    if (s.length > 160) return `${s.slice(0, 160)}…[原长 ${s.length}]`;
+    return s;
+}
 
 // ============================================================ 小工具
 
@@ -692,7 +731,8 @@ function describeContextTarget(target) {
         scopeCls: String(scope?.className || "").slice(0, 160),
         inMessageArea,
         candidateCount: candidates.length,
-        candidates: candidates.slice(0, 8)
+        // 只记摘要：data: URI 是整张图片的 base64，原样打出来就是几百 KB 一行
+        candidates: candidates.slice(0, 8).map(summarizeSource)
     };
     return { allow: candidates.length > 0 || inMessageArea, candidates, context };
 }
@@ -1007,6 +1047,33 @@ function startEntryPoll() {
     log(`入口轮询已启动（每 ${ENTRY_POLL_MS}ms 一次，只维护工具栏星标）`);
 }
 
+// ============================================================ 渲染进程看门狗
+//
+// 和主进程看门狗一个思路：主线程被卡住时定时器就停摆，恢复后第一件事就是
+// 把「卡了多久」写进日志。这是唯一能在「界面点不动」的情况下留下证据的办法。
+
+const WD_INTERVAL = 500;
+let wdTimer = null;
+let wdLast = 0;
+let wdWorst = 0;
+let wdCount = 0;
+
+function startWatchdog() {
+    if (wdTimer) return;
+    wdLast = Date.now();
+    wdTimer = setInterval(() => {
+        const now = Date.now();
+        const drift = now - wdLast - WD_INTERVAL;
+        wdLast = now;
+        if (drift > 250) {
+            wdCount++;
+            if (drift > wdWorst) wdWorst = drift;
+            log(`[看门狗] 渲染进程主线程被阻塞 ${drift}ms（累计 ${wdCount} 次，最久 ${wdWorst}ms）`);
+        }
+    }, WD_INTERVAL);
+    log(`渲染进程看门狗已启动（每 ${WD_INTERVAL}ms 检测一次主线程阻塞）`);
+}
+
 // ============================================================ 启动
 
 (async () => {
@@ -1020,6 +1087,7 @@ function startEntryPoll() {
             if (document.querySelector(".chat-func-bar")) {
                 clearInterval(gateTimer);
                 startEntryPoll();
+                startWatchdog();
             }
         };
         const gateTimer = setInterval(gate, 1000);

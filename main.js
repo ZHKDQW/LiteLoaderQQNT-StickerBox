@@ -90,6 +90,36 @@ function libraryPath() {
 
 let lastRotationCheck = 0;
 
+/**
+ * 日志安全阀。
+ *
+ * 【为什么必须有】踩过一次：右键大表情时，QQ 用 data: URI 内联整张图片，
+ * 我们的候选列表把它原样 JSON.stringify 进日志 —— **单行 386,862 字符**，
+ * debug.log.old 只有 3 行却有 1.13 MB。而日志是主进程 appendFileSync 同步写的，
+ * 每写一次就阻塞一次主线程（托盘菜单都会跟着没反应）。
+ *
+ * 所以：任何值进日志前都必须截断，整行也要有硬上限。
+ */
+const LOG_MAX_VALUE = 300;
+const LOG_MAX_LINE = 8000;
+
+function clipValue(v) {
+    let s;
+    if (typeof v === "string") s = v;
+    else if (v instanceof Error) s = v.stack || String(v);
+    else {
+        try {
+            s = JSON.stringify(v);
+        } catch (e) {
+            s = String(v);
+        }
+    }
+    if (typeof s !== "string") s = String(s);
+    if (s.length <= LOG_MAX_VALUE) return s;
+    const tag = /^data:/i.test(s) ? "data URI" : "长内容";
+    return `${s.slice(0, LOG_MAX_VALUE)}…[${tag}已截断，原长 ${s.length} 字符]`;
+}
+
 function log(...args) {
     if (!config.debugLog) return;
     try {
@@ -107,13 +137,59 @@ function log(...args) {
                 /* ignore */
             }
         }
-        const line = `[${new Date().toISOString()}] ${args
-            .map((a) => (typeof a === "string" ? a : JSON.stringify(a)))
-            .join(" ")}\n`;
+        let line = `[${new Date().toISOString()}] ${args.map(clipValue).join(" ")}\n`;
+        if (line.length > LOG_MAX_LINE) {
+            line = `${line.slice(0, LOG_MAX_LINE)}…[整行超长已截断，原长 ${line.length} 字符]\n`;
+        }
         fs.appendFileSync(logPath, line, "utf8");
     } catch (e) {
         /* 日志失败不能影响主流程 */
     }
+}
+
+// ============================================================ 主进程看门狗
+//
+// 「QQ 无法交互、托盘也点不掉、只能任务管理器」= 主进程事件循环被卡住。
+// 光靠复现猜不出来，所以这里直接测：一个每 500ms 跑一次的定时器，
+// 如果实际间隔明显超出预期，说明中间有东西阻塞了事件循环 —— 阻塞一结束
+// 这条日志就会落盘，把「什么时候、卡了多久」钉死。
+//
+// 同时每 30 秒记一次内存，用来判断是不是内存涨到拖垮了它。
+
+const WATCHDOG_INTERVAL = 500;
+let watchdogTimer = null;
+let watchdogLast = 0;
+let watchdogWorst = 0;
+let watchdogCount = 0;
+
+function startWatchdog() {
+    if (watchdogTimer) return;
+    watchdogLast = Date.now();
+    watchdogTimer = setInterval(() => {
+        const now = Date.now();
+        const drift = now - watchdogLast - WATCHDOG_INTERVAL;
+        watchdogLast = now;
+        if (drift > 250) {
+            watchdogCount++;
+            if (drift > watchdogWorst) watchdogWorst = drift;
+            const mem = process.memoryUsage();
+            log(
+                `[看门狗] 主进程事件循环被阻塞 ${drift}ms（累计 ${watchdogCount} 次，最久 ${watchdogWorst}ms）` +
+                    ` 内存 rss=${Math.round(mem.rss / 1048576)}MB heap=${Math.round(mem.heapUsed / 1048576)}MB`
+            );
+        }
+    }, WATCHDOG_INTERVAL);
+    // 定时器不能拖住 QQ 退出
+    if (watchdogTimer.unref) watchdogTimer.unref();
+
+    // 低频内存快照：内存缓慢泄漏用上面的 drift 是看不出来的
+    const memTimer = setInterval(() => {
+        const mem = process.memoryUsage();
+        log(`[看门狗] 内存 rss=${Math.round(mem.rss / 1048576)}MB heap=${Math.round(mem.heapUsed / 1048576)}MB`);
+    }, 30000);
+    if (memTimer.unref) memTimer.unref();
+
+    log(`主进程看门狗已启动（每 ${WATCHDOG_INTERVAL}ms 检测一次事件循环阻塞）`);
 }
 
 function loadJson(file, fallback) {
@@ -332,6 +408,29 @@ function preferOriginal(p) {
 }
 
 async function fetchSource(src) {
+    // data: URI —— QQ 的「大表情」/收藏表情经常是内联 base64，没有本地文件可复制。
+    // 直接解码存盘，否则这类表情右键根本存不进库。
+    if (/^data:/i.test(src)) {
+        const m = /^data:([^;,]+)?(;base64)?,([\s\S]*)$/i.exec(src);
+        if (!m) throw new Error("无法解析的 data URI");
+        const mime = String(m[1] || "image/png").toLowerCase();
+        const isB64 = !!m[2];
+        const payload = m[3] || "";
+        const buf = isB64 ? Buffer.from(payload, "base64") : Buffer.from(decodeURIComponent(payload), "utf8");
+        if (!buf.length) throw new Error("data URI 内容为空");
+        const ext = mime.includes("gif")
+            ? ".gif"
+            : mime.includes("webp")
+              ? ".webp"
+              : mime.includes("jpeg") || mime.includes("jpg")
+                ? ".jpg"
+                : mime.includes("png")
+                  ? ".png"
+                  : "";
+        log(`data: URI 已解码：${mime} ${isB64 ? "base64" : "明文"} ${buf.length}B`);
+        return { buf, name: "marketface" + ext };
+    }
+
     let local = sourceToLocalPath(src);
     if (local) {
         if (!fs.existsSync(local)) throw new Error("本地文件不存在: " + local);
@@ -561,9 +660,29 @@ function makeDragIcon(p) {
 }
 
 function registerIpc() {
-    ipcMain.handle(CH("getConfig"), () => ({ ...config, libraryPathResolved: libraryPath() }));
+    /**
+     * 统一包一层计时。
+     * 主进程里任何超过 150ms 的处理都会留下证据 —— 「QQ 无法交互」这类问题
+     * 靠猜是猜不出来的，必须让慢的那一步自己现形。
+     */
+    const handle = (method, fn) => {
+        ipcMain.handle(CH(method), async (e, ...args) => {
+            const t0 = Date.now();
+            try {
+                return await fn(e, ...args);
+            } catch (err) {
+                log(`IPC ${method} 异常: ${String(err)}`);
+                throw err;
+            } finally {
+                const dt = Date.now() - t0;
+                if (dt > 150) log(`[慢] IPC ${method} 耗时 ${dt}ms`);
+            }
+        });
+    };
 
-    ipcMain.handle(CH("setConfig"), (e, patch) => {
+    handle("getConfig", () => ({ ...config, libraryPathResolved: libraryPath() }));
+
+    handle("setConfig", (e, patch) => {
         config = { ...config, ...(patch || {}) };
         saveJson(configPath, config);
         ensureDirs();
@@ -571,8 +690,8 @@ function registerIpc() {
         return { ...config, libraryPathResolved: libraryPath() };
     });
 
-    ipcMain.handle(CH("list"), (e, query) => listItems(query));
-    ipcMain.handle(CH("stats"), () => {
+    handle("list", (e, query) => listItems(query));
+    handle("stats", () => {
         const items = listItems("");
         return {
             count: items.length,
@@ -581,15 +700,15 @@ function registerIpc() {
         };
     });
 
-    ipcMain.handle(CH("remove"), (e, names) => removeItems(names));
-    ipcMain.handle(CH("rename"), (e, payload) => renameItem(payload || {}));
+    handle("remove", (e, names) => removeItems(names));
+    handle("rename", (e, payload) => renameItem(payload || {}));
 
     /**
      * 兜底插入方案：把图片写进系统剪贴板，然后让页面执行一次「真实粘贴」。
      * 合成 paste 事件在 QQ 里可能被忽略，这条走的是 Chromium 原生粘贴通路。
      * 注意：nativeImage 只认 PNG/JPEG，GIF/WebP 会返回空图，这里如实上报。
      */
-    ipcMain.handle(CH("pasteFile"), async (e, name) => {
+    handle("pasteFile", async (e, name) => {
         try {
             const n = String(name || "");
             if (path.basename(n) !== n) return { ok: false, error: "非法文件名" };
@@ -626,7 +745,7 @@ function registerIpc() {
      * （和从资源管理器拖文件完全一样），所以 **动图能保住动画**，
      * 也不占用系统剪贴板、不需要任何合成事件。
      */
-    ipcMain.handle(CH("startDrag"), (e, name) => {
+    handle("startDrag", (e, name) => {
         try {
             const n = String(name || "");
             if (path.basename(n) !== n) return { ok: false, error: "非法文件名" };
@@ -645,7 +764,12 @@ function registerIpc() {
                 log("startDrag: 图标仍然为空，拖拽可能不生效", n);
             }
 
+            // startDrag 在 Windows 上会跑一个嵌套消息循环，直到拖放结束才返回。
+            // 前后各记一笔：只看到「开始」没有「结束」= 它卡住了。
+            const dragT0 = Date.now();
+            log("startDrag: 开始（等待拖放结束）", n);
             wc.startDrag({ file: p, icon });
+            log(`startDrag: 结束，阻塞了 ${Date.now() - dragT0}ms`);
             log(`startDrag: 已发起原生拖拽 ${n}（图标来源: ${from}）`);
             return { ok: true, iconFrom: from };
         } catch (err) {
@@ -659,7 +783,7 @@ function registerIpc() {
      * GIF/WebP 无法走 pasteFile（nativeImage 解不了），渲染进程会用 canvas 取首帧转 PNG
      * 后从这里进来。
      */
-    ipcMain.handle(CH("pastePng"), async (e, name, buffer) => {
+    handle("pastePng", async (e, name, buffer) => {
         try {
             const buf = Buffer.from(buffer || []);
             if (!buf.length) return { ok: false, error: "收到空字节" };
@@ -685,7 +809,7 @@ function registerIpc() {
      * 这是「填入输入框」的兜底通道：首选 local:// 协议 fetch，
      * 万一该协议在渲染进程里不可用，就用这条路把图交过去。
      */
-    ipcMain.handle(CH("readFile"), (e, name) => {
+    handle("readFile", (e, name) => {
         try {
             const n = String(name || "");
             if (path.basename(n) !== n) return { ok: false, error: "非法文件名" };
@@ -708,12 +832,12 @@ function registerIpc() {
         }
     });
 
-    ipcMain.handle(CH("saveCandidates"), async (e, payload) => {
+    handle("saveCandidates", async (e, payload) => {
         ensureDirs();
         return await saveCandidates(payload || {});
     });
 
-    ipcMain.handle(CH("importFiles"), async () => {
+    handle("importFiles", async () => {
         const r = await dialog.showOpenDialog({
             title: "选择要导入表情库的图片（可多选）",
             properties: ["openFile", "multiSelections", "dontAddToRecent"],
@@ -723,7 +847,7 @@ function registerIpc() {
         return importPaths(r.filePaths);
     });
 
-    ipcMain.handle(CH("importFolder"), async () => {
+    handle("importFolder", async () => {
         const r = await dialog.showOpenDialog({
             title: "选择要导入的文件夹（只扫描一层）",
             properties: ["openDirectory", "dontAddToRecent"]
@@ -749,7 +873,7 @@ function registerIpc() {
         return importPaths(files);
     });
 
-    ipcMain.handle(CH("chooseLibrary"), async () => {
+    handle("chooseLibrary", async () => {
         const r = await dialog.showOpenDialog({
             title: "选择表情库目录",
             properties: ["openDirectory", "createDirectory", "dontAddToRecent"]
@@ -762,19 +886,19 @@ function registerIpc() {
         return { ok: true, libraryPath: libraryPath() };
     });
 
-    ipcMain.handle(CH("openLibrary"), async () => {
+    handle("openLibrary", async () => {
         ensureDirs();
         const err = await shell.openPath(libraryPath());
         return err ? { ok: false, error: err } : { ok: true };
     });
 
-    ipcMain.handle(CH("reveal"), (e, name) => {
+    handle("reveal", (e, name) => {
         if (path.basename(String(name)) !== String(name)) return { ok: false };
         shell.showItemInFolder(path.join(libraryPath(), String(name)));
         return { ok: true };
     });
 
-    ipcMain.handle(CH("clearLibrary"), async () => {
+    handle("clearLibrary", async () => {
         const items = listItems("");
         if (!items.length) return { ok: true, removed: 0 };
         const r = await dialog.showMessageBox({
@@ -803,12 +927,12 @@ function registerIpc() {
         return { ok: true, removed };
     });
 
-    ipcMain.handle(CH("log"), (e, message) => {
+    handle("log", (e, message) => {
         log("[renderer]", message);
         return true;
     });
 
-    ipcMain.handle(CH("openLog"), async () => {
+    handle("openLog", async () => {
         try {
             if (!fs.existsSync(logPath)) fs.writeFileSync(logPath, "", "utf8");
             const err = await shell.openPath(logPath);
@@ -818,7 +942,7 @@ function registerIpc() {
         }
     });
 
-    ipcMain.handle(CH("openPath"), async (e, p) => {
+    handle("openPath", async (e, p) => {
         const err = await shell.openPath(String(p));
         return err ? { ok: false, error: err } : { ok: true };
     });
@@ -844,6 +968,8 @@ function onLoad() {
     } catch (e) {
         log("读取 LiteLoader 版本信息失败: " + String(e));
     }
+
+    startWatchdog();
 }
 
 onLoad();
