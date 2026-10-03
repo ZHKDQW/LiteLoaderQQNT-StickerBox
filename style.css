@@ -1,0 +1,290 @@
+/* 本地表情包库 - 样式
+   全部使用 QQ 自己的 CSS 变量，并给 fallback，保证明暗主题都正常 */
+
+/* 工具栏星标克隆自 QQ 自己的 .bar-icon，所以会跟随工具栏的悬停/折叠样式。
+   这里只保证图标尺寸和可点区域。
+   注：面板内的入口已按用户要求移除，所以不再需要浮层容器样式。 */
+.sb-bar-icon {
+    cursor: pointer;
+    display: flex;
+    align-items: center;
+    justify-content: center;
+}
+
+.sb-bar-icon svg,
+.sb-bar-icon i.q-icon svg {
+    width: 20px;
+    height: 20px;
+}
+
+/* ---------------------------------------------------------- 主面板 */
+
+.sb-panel {
+    position: fixed;
+    z-index: 9999;
+    width: 400px;
+    height: 360px;
+    display: flex;
+    flex-direction: column;
+    border-radius: 10px;
+    background: var(--bg_bottom_standard, var(--fill_light_primary, #1e1e1e));
+    box-shadow: 0 8px 32px rgba(0, 0, 0, 0.45);
+    border: 1px solid var(--border_level_1, rgba(127, 127, 127, 0.25));
+    color: var(--text_primary, #e6e6e6);
+    font-size: 13px;
+    overflow: hidden;
+    user-select: none;
+}
+
+.sb-head {
+    display: flex;
+    align-items: center;
+    gap: 6px;
+    padding: 8px 10px;
+    border-bottom: 1px solid var(--border_level_1, rgba(127, 127, 127, 0.2));
+    flex-shrink: 0;
+}
+
+.sb-title {
+    font-weight: 600;
+    white-space: nowrap;
+}
+
+.sb-count {
+    color: var(--text_secondary, #999);
+    font-size: 12px;
+    white-space: nowrap;
+}
+
+.sb-spacer {
+    flex: 1;
+}
+
+.sb-btn {
+    border: none;
+    background: transparent;
+    color: var(--text_secondary, #aaa);
+    cursor: pointer;
+    font-size: 12px;
+    padding: 3px 6px;
+    border-radius: 5px;
+    white-space: nowrap;
+}
+
+.sb-btn:hover {
+    background: var(--fill_light_secondary, rgba(127, 127, 127, 0.2));
+    color: var(--text_primary, #fff);
+}
+
+.sb-btn--close {
+    font-size: 13px;
+    padding: 3px 7px;
+}
+
+.sb-search {
+    padding: 8px 10px 4px;
+    flex-shrink: 0;
+}
+
+.sb-search input {
+    width: 100%;
+    box-sizing: border-box;
+    border: none;
+    outline: none;
+    border-radius: 6px;
+    padding: 6px 10px;
+    font-size: 12px;
+    background: var(--fill_light_secondary, rgba(127, 127, 127, 0.16));
+    color: var(--text_primary, #eee);
+}
+
+.sb-search input::placeholder {
+    color: var(--text_tertiary, #888);
+}
+
+/* ---------------------------------------------------------- 网格 */
+
+.sb-grid {
+    flex: 1;
+    overflow-y: auto;
+    overflow-x: hidden;
+    padding: 6px 8px 8px;
+    display: grid;
+    grid-template-columns: repeat(auto-fill, minmax(56px, 1fr));
+    gap: 6px;
+    align-content: start;
+}
+
+.sb-grid::-webkit-scrollbar {
+    width: 8px;
+}
+
+.sb-grid::-webkit-scrollbar-thumb {
+    background: var(--bg_top_standard, rgba(127, 127, 127, 0.35));
+    border-radius: 4px;
+}
+
+.sb-item {
+    position: relative;
+    aspect-ratio: 1 / 1;
+    border-radius: 8px;
+    overflow: hidden;
+    cursor: pointer;
+    background: var(--fill_light_secondary, rgba(127, 127, 127, 0.12));
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    transition: transform 0.08s ease-out, background 0.12s;
+}
+
+.sb-item:hover {
+    background: var(--fill_light_tertiary, rgba(127, 127, 127, 0.28));
+    transform: scale(1.06);
+}
+
+.sb-item img {
+    width: 100%;
+    height: 100%;
+    object-fit: contain;
+    pointer-events: none;
+}
+
+.sb-empty {
+    position: absolute;
+    left: 0;
+    right: 0;
+    top: 96px;
+    text-align: center;
+    color: var(--text_secondary, #999);
+    font-size: 12px;
+    line-height: 1.9;
+    padding: 0 24px;
+    pointer-events: none;
+}
+
+.sb-empty b {
+    color: var(--text_primary, #ddd);
+}
+
+.sb-foot {
+    flex-shrink: 0;
+    padding: 5px 10px;
+    font-size: 11px;
+    color: var(--text_tertiary, #888);
+    border-top: 1px solid var(--border_level_1, rgba(127, 127, 127, 0.2));
+    white-space: nowrap;
+    overflow: hidden;
+    text-overflow: ellipsis;
+    direction: rtl;
+    text-align: left;
+}
+
+/* ---------------------------------------------------------- 单项右键菜单 */
+
+.sb-itemmenu {
+    position: fixed;
+    z-index: 10000;
+    min-width: 148px;
+    padding: 5px;
+    border-radius: 8px;
+    background: var(--bg_bottom_standard, #232323);
+    border: 1px solid var(--border_level_1, rgba(127, 127, 127, 0.28));
+    box-shadow: 0 6px 24px rgba(0, 0, 0, 0.5);
+}
+
+.sb-itemmenu button {
+    display: block;
+    width: 100%;
+    text-align: left;
+    border: none;
+    background: transparent;
+    color: var(--text_primary, #e6e6e6);
+    font-size: 12px;
+    padding: 7px 10px;
+    border-radius: 5px;
+    cursor: pointer;
+}
+
+.sb-itemmenu button:hover {
+    background: var(--fill_light_secondary, rgba(127, 127, 127, 0.22));
+}
+
+.sb-itemmenu button.sb-danger {
+    color: #ff6b6b;
+}
+
+/* ---------------------------------------------------------- 提示条 */
+
+.sb-toast {
+    position: fixed;
+    left: 50%;
+    bottom: 96px;
+    transform: translate(-50%, 12px);
+    z-index: 10001;
+    max-width: 460px;
+    padding: 9px 16px;
+    border-radius: 8px;
+    background: rgba(0, 0, 0, 0.82);
+    color: #fff;
+    font-size: 12.5px;
+    line-height: 1.5;
+    opacity: 0;
+    pointer-events: none;
+    transition: opacity 0.18s, transform 0.18s;
+    word-break: break-all;
+}
+
+.sb-toast--show {
+    opacity: 1;
+    transform: translate(-50%, 0);
+}
+
+.sb-toast--error {
+    background: rgba(180, 40, 40, 0.9);
+}
+
+/* 右键菜单里的注入项 */
+.sb-menu-item .q-context-menu-item__icon svg,
+.sb-menu-item svg.q-icon {
+    width: 18px;
+    height: 18px;
+}
+
+/* ---------------------------------------------------------- 缩略图上的动图角标 */
+.sb-item__badge {
+    position: absolute;
+    right: 3px;
+    bottom: 3px;
+    padding: 0 4px;
+    border-radius: 4px;
+    font-size: 9px;
+    line-height: 13px;
+    color: #fff;
+    background: rgba(0, 0, 0, 0.55);
+    pointer-events: none;
+}
+
+/* 可拖拽的提示 */
+.sb-item[draggable="true"] {
+    cursor: grab;
+}
+
+.sb-item[draggable="true"]:active {
+    cursor: grabbing;
+}
+
+/* 动图格子在悬停时提示"拖进聊天窗口"，因为点击只能拿到静态首帧 */
+.sb-item[data-anim="true"]:hover::after {
+    content: "拖进聊天窗口";
+    position: absolute;
+    left: 0;
+    right: 0;
+    bottom: 0;
+    font-size: 10px;
+    line-height: 16px;
+    text-align: center;
+    color: #fff;
+    background: rgba(0, 0, 0, 0.62);
+    pointer-events: none;
+}
+

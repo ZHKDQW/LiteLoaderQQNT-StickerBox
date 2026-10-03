@@ -1,0 +1,21 @@
+# 依赖与测试产物
+node_modules/
+.npm-cache/
+package-lock.json
+tools/sandbox/
+tools/deployed-sandbox/
+
+# 打包产物
+*.zip
+
+# 运行期日志（开发时可能被误拷进来）
+debug.log
+debug.log.old
+
+# 编辑器 / 系统
+.vscode/
+.idea/
+Thumbs.db
+desktop.ini
+*.swp
+.DS_Store

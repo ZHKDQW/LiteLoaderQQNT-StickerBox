@@ -1,0 +1,18 @@
+{
+    "name": "sticker-box-tools",
+    "private": true,
+    "version": "0.1.0",
+    "description": "本地表情包库 的开发与测试工具",
+    "scripts": {
+        "check": "node check-plugin.mjs ..",
+        "test:main": "node test-main.mjs",
+        "test:renderer": "node test-renderer.mjs",
+        "test": "npm run check && npm run test:main && npm run test:renderer",
+        "deploy": "node deploy.mjs",
+        "log": "node read-log.mjs",
+        "icon": "node make-drag-icon.mjs"
+    },
+    "devDependencies": {
+        "jsdom": "^29.1.1"
+    }
+}
