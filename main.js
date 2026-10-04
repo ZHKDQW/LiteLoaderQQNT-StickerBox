@@ -70,7 +70,15 @@ const defaultConfig = {
     /** 点击表情后是否自动关闭面板 */
     closeAfterInsert: false,
     /** 是否在 QQ 表情面板里注入「本地表情库」入口 */
-    panelEntry: true
+    panelEntry: true,
+    /**
+     * 窗口从最小化恢复后，自动尝试「唤活」界面。
+     *
+     * Chromium 在 Windows 上有个已知问题：恢复后界面看着正常但点不动
+     * （QQNT / VS Code / Chrome / Edge 都有报告，见 microsoft/vscode#167556）。
+     * 这里做的只是强制重绘 + 聚焦，无害；治不了根，但可能省掉一次任务管理器。
+     */
+    wakeOnRestore: true
 };
 
 let config = { ...defaultConfig };
@@ -851,6 +859,39 @@ function registerIpc() {
         }
     });
 
+
+    /**
+     * 最小化恢复后「唤活」窗口。
+     *
+     * 【背景】Chromium 在 Windows 上有个存在多年的已知问题：窗口从最小化等状态恢复后，
+     * 界面看起来完全正常，但**点哪里都没反应**（鼠标没冻结，最大化/最小化本身也正常）。
+     * 这不是本插件引起的 —— QQNT、VS Code、Chrome、Edge 都有人报告同样症状
+     * （见 microsoft/vscode#167556），根因指向 Chromium 的 GPU 渲染管线。
+     * 也正因为卡在那一层，我的看门狗测不到它：主进程事件循环只记录了 253ms，一切"正常"。
+     *
+     * 社区 workaround 是在输入框里右键 → 粘贴任意字符，本质是**给窗口一个输入事件**
+     * 把它从假死中唤醒。这里在窗口恢复可见时自动做一次等价操作：强制重绘 + 聚焦。
+     * 治不了根，但可能省掉一次任务管理器。
+     */
+    handle("wakeWindow", (e) => {
+        const wc = resolveTargetWebContents(e);
+        if (!wc) return { ok: false, error: "找不到窗口" };
+        const done = [];
+        try {
+            wc.invalidate(); // 强制重绘，最接近"唤醒渲染管线"的无害操作
+            done.push("invalidate");
+        } catch (err) {
+            log("wakeWindow: invalidate 失败 " + String(err));
+        }
+        try {
+            wc.focus();
+            done.push("focus");
+        } catch (err) {
+            log("wakeWindow: focus 失败 " + String(err));
+        }
+        log("wakeWindow: 窗口恢复可见，已尝试唤醒（" + done.join("+") + "）");
+        return { ok: done.length > 0, done };
+    });
 
     /**
      * 把渲染进程转好的 PNG 字节写进剪贴板并触发真实粘贴。

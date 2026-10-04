@@ -17,6 +17,10 @@ const api = {
     pasteFile: (name) => ipcRenderer.invoke(CH("pasteFile"), name),
     pastePng: (name, buffer) => ipcRenderer.invoke(CH("pastePng"), name, buffer),
     startDrag: (name) => ipcRenderer.invoke(CH("startDrag"), name),
+    // 最小化恢复后唤活窗口。Chromium 在 Windows 上恢复后界面可能点不动
+    // （QQNT / VS Code / Chrome / Edge 都有报告，见 microsoft/vscode#167556），
+    // 这里只做强制重绘 + 聚焦 —— 无害，但可能省掉一次任务管理器。
+    wakeWindow: () => ipcRenderer.invoke(CH("wakeWindow")),
 
     // ---- 入库 ----
     saveCandidates: (payload) => ipcRenderer.invoke(CH("saveCandidates"), payload),

@@ -1127,6 +1127,31 @@ function startWatchdog() {
         log("渲染进程就绪，插件目录: " + PLUGIN_DIR);
         ensureToolbarEntry();
 
+        // ---------- 最小化恢复后唤活界面 ----------
+        //
+        // Chromium 在 Windows 上有个存在多年的已知问题：窗口从最小化恢复后，界面看着
+        // 完全正常，但**点哪里都没反应**（鼠标没冻结，最大化/最小化本身也正常）。
+        // QQNT、VS Code、Chrome、Edge 都有人报告同样症状（microsoft/vscode#167556），
+        // 根因指向 Chromium 的 GPU 渲染管线 —— 也正因为卡在那一层，插件的看门狗
+        // 测不到它（主进程事件循环只记录到 253ms，看起来一切正常）。
+        //
+        // 社区 workaround 是在输入框里右键 → 粘贴任意字符，本质是**给窗口一个输入事件**
+        // 把它从假死里唤醒。这里在恢复可见时自动做一次等价操作：强制重绘 + 聚焦。
+        document.addEventListener("visibilitychange", () => {
+            if (document.visibilityState !== "visible") return;
+            if (config.wakeOnRestore === false) return;
+            // 等 Chromium 把恢复流程走完再戳，太早没有意义
+            setTimeout(() => {
+                api.wakeWindow()
+                    .then((r) => {
+                        if (r && r.ok) log("恢复可见，已尝试唤活窗口（" + (r.done || []).join("+") + "）");
+                    })
+                    .catch(() => {
+                        /* 唤活失败不影响任何功能 */
+                    });
+            }, 800);
+        });
+
         // 只在聊天窗口里跑轮询，免得登录窗/设置窗白跑
         const gate = () => {
             if (document.querySelector(".chat-func-bar")) {

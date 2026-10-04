@@ -210,6 +210,7 @@ mk("pasteFile", (name) =>
 );
 mk("pastePng", () => ({ ok: true, size: { width: 32, height: 32, bytes: 4 } }));
 mk("startDrag", () => ({ ok: true }));
+mk("wakeWindow", () => ({ ok: true, done: ["invalidate", "focus"] }));
 // ★ 动图走「文件 URI」方式：模拟 QQ 插入 <msg-img data-url="真实路径">，
 // 这样 waitForEditorChange 才能检测到变化（真实的 QQ 就是这么插入的）
 mk("chooseLibrary", () => ({ ok: true, libraryPath: "D:\\newlib" }));
@@ -456,7 +457,7 @@ try {
     produced.length >= 10 ? ok(`自检产出了 ${produced.length} 行报告`) : bad(`自检输出不足: ${produced.length} 行`);
     logLines.some((l) => l.includes("local:// fetch 测试: ok=true")) ? ok("自检实测了 local:// 协议且成功") : bad("自检里的 local:// 测试没成功");
     logLines.some((l) => l.includes("SELF-TEST END")) ? ok("自检正常收尾") : bad("自检没有收尾标记");
-    produced.some((l) => l.includes("window.sticker_box: 20 个方法")) ? ok("自检确认 20 个 API 方法都在") : bad("自检没确认到 API（方法数应为 20）");
+    produced.some((l) => l.includes("window.sticker_box: 21 个方法")) ? ok("自检确认 21 个 API 方法都在") : bad("自检没确认到 API（方法数应为 21）");
 } catch (e) {
     bad("设置页执行抛异常: " + e.message);
 }
@@ -596,6 +597,28 @@ try {
         : bad(`${over.length} 行日志超过 2000 字符，最长 ${worst.length} 字符`);
 } catch (e) {
     bad("12d 抛异常: " + e.message);
+}
+
+console.log("\n== 13) 最小化恢复的唤活（Chromium 在 Windows 上的已知假死） ==");
+{
+    const src = fs.readFileSync(new URL("../renderer.js", import.meta.url), "utf8");
+    const mainSrc = fs.readFileSync(new URL("../main.js", import.meta.url), "utf8");
+
+    src.includes('document.addEventListener("visibilitychange"')
+        ? ok("渲染进程监听了 visibilitychange")
+        : bad("没有监听 visibilitychange，恢复后不会唤活");
+    /visibilityState !== "visible"/.test(src) ? ok("只在变为可见时触发") : bad("没有判断可见性");
+    /config\.wakeOnRestore === false/.test(src) ? ok("有 wakeOnRestore 开关") : bad("没有开关");
+    /handle\("wakeWindow"/.test(mainSrc) ? ok("主进程有 wakeWindow handler") : bad("缺少 wakeWindow handler");
+    /wc\.invalidate\(\)/.test(mainSrc) ? ok("用 invalidate 强制重绘") : bad("没有强制重绘");
+    /wc\.focus\(\)/.test(mainSrc) ? ok("同时聚焦窗口") : bad("没有聚焦");
+
+    // 必须无害：不能碰剪贴板、不能发合成按键（那会干扰输入法和快捷键）
+    const a = mainSrc.indexOf('handle("wakeWindow"');
+    const b = mainSrc.indexOf('handle("pastePng"');
+    const blk = a >= 0 && b > a ? mainSrc.slice(a, b) : "";
+    blk && !/clipboard\./.test(blk) ? ok("唤活过程不碰系统剪贴板") : bad("唤活动了剪贴板");
+    blk && !/sendInputEvent/.test(blk) ? ok("不发合成按键（不干扰输入法/快捷键）") : bad("发了合成按键");
 }
 
 console.log(`\n================ 结果: ${pass} 通过 / ${fail} 失败 ================`);

@@ -89,7 +89,7 @@ function writeSrc(name, buf) {
 
 console.log("== 1) main.js 加载 ==");
 Object.keys(mainExports || {}).length >= 0 ? ok("模块加载成功，导出 " + Object.keys(mainExports || {}).length + " 个键") : bad("导出异常");
-eq(H.size, 20, "注册了 20 个 ipc handler");
+eq(H.size, 21, "注册了 21 个 ipc handler");
 
 console.log("\n== 2) 初始配置 ==");
 const cfg0 = await call("getConfig");
