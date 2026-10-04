@@ -1,3 +1,4 @@
+const path = require("path");
 /**
  * electron 模块的 mock，只覆盖 sticker_box 主进程用到的 API。
  * 通过 Module._resolveFilename 钩子注入，这样测的是真实的 main.js，不是副本。
@@ -58,7 +59,16 @@ module.exports = {
     },
     app: {
         whenReady: () => Promise.resolve(),
-        getPath: () => ""
+        getPath: () => {
+            // 给个真实存在的目录：端到端测试要靠它找到插件写出来的剪贴板脚本
+            const dir = process.env.SB_MOCK_TEMP || path.join(__dirname, "sandbox", "temp");
+            try {
+                require("fs").mkdirSync(dir, { recursive: true });
+            } catch (e) {
+                /* ignore */
+            }
+            return dir;
+        }
     },
     clipboard: {
         writeImage: (img) => globalThis.__mock.clipboardImages.push(img)

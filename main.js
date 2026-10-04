@@ -12,6 +12,7 @@
 const fs = require("fs");
 const path = require("path");
 const crypto = require("crypto");
+const { spawn } = require("child_process");
 const { shell, dialog, ipcMain, net, app, clipboard, nativeImage, webContents, BrowserWindow } = require("electron");
 
 const SLUG = "sticker_box";
@@ -157,10 +158,14 @@ function log(...args) {
 // 同时每 30 秒记一次内存，用来判断是不是内存涨到拖垮了它。
 
 const WATCHDOG_INTERVAL = 500;
+const WD_REPORT_GAP = 10000; // 两条报告至少隔 10 秒（渲染进程那边曾一晚刷出 808 条）
+const WD_SLEEP_HINT = 20000; // 这个量级更像系统休眠
 let watchdogTimer = null;
 let watchdogLast = 0;
 let watchdogWorst = 0;
 let watchdogCount = 0;
+let watchdogLastReportAt = 0;
+let watchdogSuppressed = 0;
 
 function startWatchdog() {
     if (watchdogTimer) return;
@@ -172,10 +177,20 @@ function startWatchdog() {
         if (drift > 250) {
             watchdogCount++;
             if (drift > watchdogWorst) watchdogWorst = drift;
+
+            // 退避：只记第一条，期间的一律合并计数
+            if (now - watchdogLastReportAt < WD_REPORT_GAP) {
+                watchdogSuppressed++;
+                return;
+            }
+            const extra = watchdogSuppressed ? `，期间另有 ${watchdogSuppressed} 次未记录` : "";
+            const hint = drift > WD_SLEEP_HINT ? "（更像系统休眠/挂起，不是阻塞）" : "";
+            watchdogSuppressed = 0;
+            watchdogLastReportAt = now;
             const mem = process.memoryUsage();
             log(
                 `[看门狗] 主进程事件循环被阻塞 ${drift}ms（累计 ${watchdogCount} 次，最久 ${watchdogWorst}ms）` +
-                    ` 内存 rss=${Math.round(mem.rss / 1048576)}MB heap=${Math.round(mem.heapUsed / 1048576)}MB`
+                    ` 内存 rss=${Math.round(mem.rss / 1048576)}MB heap=${Math.round(mem.heapUsed / 1048576)}MB${extra}${hint}`
             );
         }
     }, WATCHDOG_INTERVAL);
@@ -276,7 +291,10 @@ function saveBuffer(buf, desiredName, source) {
         const base = sanitizeName(desiredName, "sticker_" + hash.slice(0, 8));
         let fileName = base + ext;
         let i = 1;
-        while (fs.existsSync(path.join(libraryPath(), fileName))) {
+        // 加上限：理论上前缀一直递增总能找到空位，但没有边界就不是"能结束"而是"看起来能结束"
+    let dedupeGuard = 0;
+    while (fs.existsSync(path.join(libraryPath(), fileName))) {
+        if (++dedupeGuard > 5000) throw new Error("同名文件过多，放弃自动重命名: " + fileName);
             // 同名但内容不同（去重已排除同内容）-> 加序号
             fileName = `${base} (${++i})${ext}`;
             if (i > 999) {
@@ -440,7 +458,7 @@ async function fetchSource(src) {
                 `(${fs.statSync(local).size}B -> ${fs.statSync(better).size}B)`);
             local = better;
         }
-        return { buf: fs.readFileSync(local), name: path.basename(local) };
+        return { buf: await fs.promises.readFile(local), name: path.basename(local) };
     }
 
     const s = String(src).trim();
@@ -455,7 +473,15 @@ async function fetchSource(src) {
     }
 
     if (/^https?:\/\//i.test(s)) {
-        const res = await net.fetch(s, { credentials: "include" });
+        // 加超时：原先能无限挂着，那个 IPC 就永远不返回（渲染进程一直等）
+        const ac = new AbortController();
+        const fetchTimer = setTimeout(() => ac.abort(), 15000);
+        let res;
+        try {
+            res = await net.fetch(s, { credentials: "include", signal: ac.signal });
+        } finally {
+            clearTimeout(fetchTimer);
+        }
         if (!res.ok) throw new Error("HTTP " + res.status);
         const ab = await res.arrayBuffer();
         const mime = (res.headers.get("content-type") || "").split(";")[0].trim().toLowerCase();
@@ -511,6 +537,47 @@ async function saveCandidates(payload) {
 
 // ---------------------------------------------------------------- 列表 / 维护
 
+/**
+ * 按**文件内容**判断真实类型，不看扩展名。
+ *
+ * 【为什么必须这样】QQ 缓存给的文件名完全不可信 —— 实测用户库里 8 个文件有 4 个
+ * 扩展名与内容不符：
+ *   31d92247...jpg  →  内容是 GIF89a（真动图，却被当静态图填成首帧）
+ *   19313953...jpg  →  内容是 PNG
+ *   a0b3e0ae...jpeg →  内容是 PNG
+ *   f10f395b...png  →  内容是 JPEG
+ * 这些名字来自 `appimg://.../Ori/<hash>_0.jpg`，QQ 只管存不管后缀。
+ * 光看扩展名判断动图，用户新加的动图就永远走不到「按文件填入」那条路。
+ */
+function sniffKind(file) {
+    try {
+        const fd = fs.openSync(file, "r");
+        // 读 4KB：APNG 的 acTL 块可能不在最开头，多读一点才稳
+        const head = Buffer.alloc(4096);
+        const n = fs.readSync(fd, head, 0, 4096, 0);
+        fs.closeSync(fd);
+        const b = head.subarray(0, n);
+        if (b.length < 12) return "unknown";
+        if (b[0] === 0x47 && b[1] === 0x49 && b[2] === 0x46) return "gif";
+        if (b[0] === 0x89 && b[1] === 0x50 && b[2] === 0x4e && b[3] === 0x47) {
+            // APNG 是 PNG 容器里多一个 acTL 块（QQ 的系统表情就是 apng 伪装成 .png）
+            return b.includes(Buffer.from("acTL", "ascii")) ? "apng" : "png";
+        }
+        if (b[0] === 0xff && b[1] === 0xd8 && b[2] === 0xff) return "jpeg";
+        if (b.subarray(0, 4).toString("ascii") === "RIFF" && b.subarray(8, 12).toString("ascii") === "WEBP") {
+            return "webp";
+        }
+        return "unknown";
+    } catch (e) {
+        return "unknown";
+    }
+}
+
+/** 这个类型能不能动？webp 有可能是静态的，但按动图处理没坏处（走文件上传而已） */
+function kindIsAnimated(kind) {
+    return kind === "gif" || kind === "apng" || kind === "webp";
+}
+
 function listItems(query) {
     const dir = libraryPath();
     let names = [];
@@ -525,21 +592,27 @@ function listItems(query) {
     const items = [];
     for (const name of names) {
         if (q && !name.toLowerCase().includes(q)) continue;
+        const full = path.join(dir, name);
         let st;
         try {
-            st = fs.statSync(path.join(dir, name));
+            st = fs.statSync(full);
         } catch (e) {
             continue;
         }
+        // 真实类型按内容判断，不看扩展名（QQ 给的缓存文件名后缀经常是错的）
+        const kind = sniffKind(full);
         items.push({
             name,
             size: st.size,
             mtime: st.mtimeMs,
             addedAt: meta.items?.[name]?.addedAt || st.mtimeMs,
-            url: toLocalUrl(path.join(dir, name)),
+            url: toLocalUrl(full),
             // 绝对路径要给渲染进程：合成 File 时得带上它（Electron 的 File.path），
             // 否则 QQ 的粘贴处理读不到文件内容，会当成「空文件」丢掉
-            filePath: path.join(dir, name)
+            filePath: full,
+            // ★ 渲染进程靠这两个字段决定走「按文件填入」还是「静态首帧」
+            kind,
+            animated: kindIsAnimated(kind)
         });
     }
     items.sort((a, b) => b.addedAt - a.addedAt);
@@ -657,6 +730,201 @@ function makeDragIcon(p) {
     }
     // 3) 内联 PNG
     return { icon: nativeImage.createFromDataURL(DRAG_ICON_DATA_URL), from: "内联 PNG" };
+}
+
+// ============================================================ 文件剪贴板（走 Shell 的 copy 动词）
+//
+// 【为什么非要这么绕】QQ 只有把图片当成**文件**才走原文件上传，动画才保得住。三条硬门槛：
+//   1. Electron 写不了 CF_HDROP —— clipboard.writeBuffer("CF_HDROP", buf) 里的名字会被
+//      RegisterClipboardFormat 注册成一个**同名的自定义格式**（实测 49902，而预定义的是 15）。
+//   2. 光有 CF_HDROP 也不够 —— Set-Clipboard -LiteralPath 只写 5 种格式，而资源管理器
+//      Ctrl+C 会写 13 种（多出 FileGroupDescriptorW、Preferred DropEffect、Shell IDList
+//      Array 等）。QQ 只认后者，自己拼这些格式又太复杂。
+//   3. ★最关键★ InvokeVerb('copy') 用的是 **OLE 延迟渲染**：真正的格式由**源进程按需渲染**。
+//      所以执行完就退出的进程等于白干 —— 实测退出后剪贴板只剩 DataObject 空壳（2 种格式）。
+//      **必须让那个进程活着**，QQ 才能取到数据。
+//
+// 所以这里的做法：起一个 PowerShell 做 InvokeVerb，然后让它 Sleep 一小时持有剪贴板。
+// 同一个文件重复点击时直接复用（0 延迟）；换文件才重启（约 1.5 秒）。
+
+const CLIP_READY = path.join(app.getPath("temp"), "sb-clip-ready.txt");
+const CLIP_VBS_PATH = path.join(app.getPath("temp"), "sb-clip-hold.vbs");
+
+// 【必须纯 ASCII】用 fs.writeFileSync(..., "ascii") 写含中文的内容会出事：
+// Node 的 ascii 编码把每个 >127 的字节截断成 7 位，中文的 UTF-8 三字节被切碎后，
+// 有的碎片正好是 \n —— 注释行被劈成两半，cscript 直接报语法错误。
+// 所以这里的注释一律写英文，并且下面有一道断言把关。
+const CLIP_VBS_SOURCE = [
+    "Option Explicit",
+    "Dim ws, sh, it, fso, f, dir, name, ready, i",
+    'Set ws = CreateObject("WScript.Shell")',
+    'dir   = ws.Environment("Process")("SB_DIR")',
+    'name  = ws.Environment("Process")("SB_NAME")',
+    'ready = ws.Environment("Process")("SB_READY")',
+    'Set sh = CreateObject("Shell.Application")',
+    "Set it = sh.Namespace(dir).ParseName(name)",
+    "If it Is Nothing Then",
+    '  WScript.Echo "__SB_CLIP_NOTFOUND__"',
+    "  WScript.Quit 3",
+    "End If",
+    'it.InvokeVerb "copy"',
+    'Set fso = CreateObject("Scripting.FileSystemObject")',
+    "Set f = fso.CreateTextFile(ready, True)",
+    'f.WriteLine "ready"',
+    "f.Close",
+    "' Hold the clipboard open: OLE delayed rendering needs this process alive.",
+    "' NOTE: WScript.Sleep takes a 16-bit integer (max 32767). Passing 60000",
+    "'       overflows silently, the call gets skipped, and the process exits.",
+    "For i = 1 To 60",
+    "  WScript.Sleep 1000",
+    "Next"
+].join("\r\n");
+
+// 把关：一旦有人往这里加了非 ASCII 字符，立刻在日志里喊出来
+if (/[^\x00-\x7F]/.test(CLIP_VBS_SOURCE)) {
+    // 这里不能用 log()（它依赖 config，而这段在模块顶层执行，config 还没准备好）
+    console.error("[sticker_box] 剪贴板脚本含非 ASCII 字符，会被写坏！");
+}
+
+let clipVbsPath = null;
+
+function ensureClipVbs() {
+    // 【每次加载都重写】不要"存在就复用"：上一版曾经把含中文的脚本用 ascii 编码写坏，
+    // 如果复用那份坏文件，用户重启一百次也还是坏的。文件才几百字节，重写成本可以忽略。
+    try {
+        fs.writeFileSync(CLIP_VBS_PATH, CLIP_VBS_SOURCE, "ascii");
+        clipVbsPath = CLIP_VBS_PATH;
+        return clipVbsPath;
+    } catch (e) {
+        log("写剪贴板脚本失败: " + String(e));
+        return null;
+    }
+}
+
+let clipHolder = null; // 持有剪贴板的子进程（用完就收，绝不留常驻）
+let clipReadyPath = null; // 当前剪贴板里准备好的是哪个文件
+let clipIdleTimer = null; // 预填后闲置回收的定时器
+
+function killClipHolder() {
+    if (clipHolder) {
+        const pid = clipHolder.pid;
+        // ★★★ 必须先清空剪贴板，再杀进程 ★★★
+        //
+        // InvokeVerb('copy') 用的是 OLE **延迟渲染**：剪贴板里存的不是数据本身，
+        // 而是"待会儿按需渲染"的承诺，由这个持有进程负责兑现。
+        //
+        // 直接 child.kill()（= TerminateProcess 强杀）时进程没机会清理，
+        // 剪贴板里就留下一个**悬空的 OLE 引用** —— 数据源已经死了。
+        // 之后任何程序去**读**它（注意：不只是枚举格式）都会挂住，
+        // 包括 QQ 自己的剪贴板监听。症状就是：填入成功，一发送 QQ 就无法交互、
+        // 托盘也关不掉，只能任务管理器。
+        //
+        // clipboard.clear() 也是一次"写剪贴板"，会把那个悬空引用顶掉，
+        // 所以顺序必须是先 clear 再 kill。
+        try {
+            clipboard.clear();
+        } catch (e) {
+            log("清空剪贴板失败（仍然回收进程）: " + String(e));
+        }
+        try {
+            if (clipHolder.exitCode === null) clipHolder.kill();
+        } catch (e) {
+            /* ignore */
+        }
+        log(`剪贴板持有进程 pid=${pid} 已回收（先清了剪贴板，避免留下悬空引用）`);
+    }
+    clipHolder = null;
+    clipReadyPath = null;
+}
+
+/** 让一个进程把 filePath 放进剪贴板；数据取走后立刻回收它 */
+function holdFileInClipboard(filePath, timeoutMs = 9000) {
+    return new Promise((resolve) => {
+        // 上一版这里是"同一个文件就复用"，但日志显示复用从来没命中过，
+        // 每次点击都新建一个 PowerShell（约 80MB）堆在那里 —— 用户实测就是
+        // 这样把系统拖垮的（QQ 无法交互、托盘没反应）。现在改成用完就收。
+        killClipHolder();
+        try {
+            fs.unlinkSync(CLIP_READY);
+        } catch (e) {
+            /* 没有就算了 */
+        }
+
+        let proc;
+        let out = "";
+        let err = "";
+        const t0 = Date.now();
+        try {
+            // 用 cscript 而不是 PowerShell：实测就绪快 26%（859ms vs 1161ms —— 后者要加载
+            // 整个 .NET 运行时），对系统的扰动也更小。路径仍然走环境变量。
+            const vbs = ensureClipVbs();
+            if (!vbs) return resolve(false);
+            proc = spawn(
+                "cscript.exe",
+                ["//nologo", vbs],
+                {
+                    windowsHide: true,
+                    stdio: ["ignore", "pipe", "pipe"],
+                    env: {
+                        ...process.env,
+                        SB_DIR: path.dirname(filePath),
+                        SB_NAME: path.basename(filePath),
+                        SB_READY: CLIP_READY
+                    }
+                }
+            );
+        } catch (e) {
+            log("剪贴板持有进程启动失败: " + String(e));
+            return resolve(false);
+        }
+        clipHolder = proc;
+        proc.stdout.on("data", (d) => (out += String(d)));
+        proc.stderr.on("data", (d) => (err += String(d)));
+        proc.on("error", (e) => log("剪贴板持有进程错误: " + String(e)));
+
+        const tick = () => {
+            if (fs.existsSync(CLIP_READY)) {
+                // 再给 OLE 一点时间把格式挂上去
+                setTimeout(() => {
+                    log(`剪贴板已就绪（${Date.now() - t0}ms，pid=${proc.pid}）`);
+                    resolve(true);
+                }, 120);
+                return;
+            }
+            if (proc.exitCode !== null) {
+                log(`剪贴板持有进程提前退出 code=${proc.exitCode} out=${JSON.stringify(out.slice(0, 120))} err=${JSON.stringify(err.slice(0, 300))}`);
+                return resolve(false);
+            }
+            if (Date.now() - t0 > timeoutMs) {
+                log(`剪贴板就绪超时 ${timeoutMs}ms  out=${JSON.stringify(out.slice(0, 120))} err=${JSON.stringify(err.slice(0, 300))}`);
+                try {
+                    proc.kill();
+                } catch (e) {
+                    /* ignore */
+                }
+                return resolve(false);
+            }
+            setTimeout(tick, 80);
+        };
+        tick();
+    });
+}
+
+// 串行队列：剪贴板是全局资源，并发会互相覆盖。
+//
+// 【注意】不是"忙就直接失败"。上一版写成 `if (clipBusy) return false`，
+// 结果悬停预填还在跑的时候点击就会立刻失败 —— 用户看到的就是"回退到静态首帧"，
+// 而且日志里只有 8ms 就返回了，根本没试。现在改成**排队**，前一个做完接着做。
+let clipQueue = Promise.resolve();
+
+function clipboardCopyFile(filePath, timeoutMs = 9000) {
+    const run = () => holdFileInClipboard(filePath, timeoutMs);
+    const p = clipQueue.then(run, run);
+    clipQueue = p.then(
+        () => {},
+        () => {}
+    );
+    return p;
 }
 
 function registerIpc() {
@@ -777,6 +1045,106 @@ function registerIpc() {
             return { ok: false, error: String(err) };
         }
     });
+
+
+    /**
+     * ★ 动图一键装填：用真正的 CF_HDROP ★
+     *
+     * 【为什么必须借外部进程】
+     * Windows 上"剪贴板里有一个文件"就是 CF_HDROP 格式。Electron 写不了它：
+     * clipboard.writeBuffer("CF_HDROP", buf) 里的名字会被 RegisterClipboardFormat
+     * 注册成一个**同名的自定义格式**（实测返回 49902，而预定义的 CF_HDROP 是 15，
+     * 字符串名字不会被映射到预定义常量）。
+     *
+     * 同理，Chromium 在剪贴板里读到 CF_HDROP 时对外报的是 text/uri-list ——
+     * 那是它的内部别名，跟我们自己写一个叫 "text/uri-list" 的格式完全是两回事。
+     * （这一条是实测踩出来的：自己写 text/uri-list，QQ 毫无反应。）
+     *
+     * 但**光有 CF_HDROP 也不够**：实测 Set-Clipboard -LiteralPath 只写 5 种格式，
+     * 而资源管理器 Ctrl+C 会写 12 种（多出 FileGroupDescriptorW、Preferred DropEffect、
+     * Shell IDList Array 等），QQ 只认后者。所以这里走 `InvokeVerb('copy')`，
+     * 让 Shell 自己把完整格式集写进去。
+     */
+    handle("pasteFileAsDrop", async (e, name) => {
+        try {
+            const n = String(name || "");
+            if (path.basename(n) !== n) return { ok: false, error: "非法文件名" };
+            const p = path.join(libraryPath(), n);
+            if (!fs.existsSync(p)) return { ok: false, error: "文件不存在: " + n };
+
+            // 悬停时已经准备好了就直接粘贴 —— 这就是"感觉 0 延迟"的来源。
+            // 每次准备都必然要起一个进程（Electron 自己写不了 CF_HDROP），
+            // 所以唯一能把体感延迟压下去的办法就是提前准备。
+            const t0 = Date.now();
+            let usedCache = false;
+            if (clipReadyPath === p && clipHolder && clipHolder.exitCode === null) {
+                usedCache = true;
+                clearTimeout(clipIdleTimer);
+            } else {
+                const wrote = await clipboardCopyFile(p);
+                if (!wrote) return { ok: false, error: "剪贴板助手不可用（见日志）" };
+                clipReadyPath = p;
+            }
+            const prepareMs = Date.now() - t0;
+            if (usedCache) log(`pasteFileAsDrop: 悬停预填命中，0 等待（${n}）`);
+
+            const wc = resolveTargetWebContents(e);
+            if (!wc) return { ok: false, error: "找不到窗口" };
+            wc.paste();
+            log(`pasteFileAsDrop: ${n} 已粘贴（准备耗时 ${prepareMs}ms${usedCache ? "，来自预填" : ""}）`);
+            // QQ 读剪贴板是异步的，给它 3 秒再回收。
+            //
+            // 【只回收"自己这一代"】上一版是无条件 killClipHolder()，结果这个定时器到点时
+            // 如果用户已经悬停到下一个动图、预填了新进程，就会把**新的**那个杀掉 ——
+            // 日志里"剪贴板已就绪"之后 1.4 秒就出现"已回收"，就是这么来的。
+            const myGeneration = clipHolder;
+            setTimeout(() => {
+                if (clipHolder === myGeneration) {
+                    killClipHolder();
+                    clipReadyPath = null;
+                }
+            }, 3000);
+            return { ok: true, prepareMs, fromCache: usedCache };
+        } catch (err) {
+            log("pasteFileAsDrop 失败: " + String(err));
+            return { ok: false, error: String((err && err.message) || err) };
+        }
+    });
+
+
+    /**
+     * 悬停预填：鼠标停在动图上时提前把剪贴板准备好，点下去就不用等那 859ms。
+     *
+     * 每次准备都必须起一个进程（Electron 写不了 CF_HDROP），所以这是唯一能把
+     * 体感延迟压到接近 0 的办法。预填后 15 秒没用上就回收，不白占着。
+     */
+    handle("prepareDrop", async (e, name) => {
+        try {
+            const n = String(name || "");
+            if (path.basename(n) !== n) return { ok: false, error: "非法文件名" };
+            const p = path.join(libraryPath(), n);
+            if (!fs.existsSync(p)) return { ok: false, error: "文件不存在: " + n };
+            if (clipReadyPath === p && clipHolder && clipHolder.exitCode === null) {
+                return { ok: true, cached: true };
+            }
+            const ok = await clipboardCopyFile(p);
+            if (ok) {
+                clipReadyPath = p;
+                clearTimeout(clipIdleTimer);
+                const myGeneration = clipHolder;
+                clipIdleTimer = setTimeout(() => {
+                    if (clipHolder !== myGeneration) return; // 已经换过一代了，别动新的
+                    log("预填超时未使用，回收持有进程");
+                    killClipHolder();
+                    clipReadyPath = null;
+                }, 15000);
+            }
+            return { ok, cached: false };
+        } catch (err) {
+            return { ok: false, error: String((err && err.message) || err) };
+        }
+    });
+
 
     /**
      * 把渲染进程转好的 PNG 字节写进剪贴板并触发真实粘贴。
@@ -970,6 +1338,13 @@ function onLoad() {
     }
 
     startWatchdog();
+
+    // 退出时把持有剪贴板的子进程收掉，别留孤儿
+    try {
+        app.on("will-quit", () => killClipHolder());
+    } catch (e) {
+        /* ignore */
+    }
 }
 
 onLoad();

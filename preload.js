@@ -17,6 +17,12 @@ const api = {
     pasteFile: (name) => ipcRenderer.invoke(CH("pasteFile"), name),
     pastePng: (name, buffer) => ipcRenderer.invoke(CH("pastePng"), name, buffer),
     startDrag: (name) => ipcRenderer.invoke(CH("startDrag"), name),
+    // ★ 动图一键装填（推荐）：用真正的 CF_HDROP 把文件放进剪贴板再粘贴，
+    // QQ 会当成"拖入文件"处理，按原文件上传，动画保留。
+    // 需要借 PowerShell 写 CF_HDROP（Electron 写不了这个格式），失败会自动降级。
+    pasteFileAsDrop: (name) => ipcRenderer.invoke(CH("pasteFileAsDrop"), name),
+    // 悬停预填：鼠标停在动图上时提前准备剪贴板，点下去就不用等那 ~860ms
+    prepareDrop: (name) => ipcRenderer.invoke(CH("prepareDrop"), name),
 
     // ---- 入库 ----
     saveCandidates: (payload) => ipcRenderer.invoke(CH("saveCandidates"), payload),

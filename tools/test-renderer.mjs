@@ -185,7 +185,7 @@ const mk = (name, impl) => {
     };
 };
 window.sticker_box = {};
-mk("getConfig", () => ({ libraryPathResolved: "C:\\lib", closeAfterInsert: false, panelEntry: true, dedupe: true }));
+mk("getConfig", () => ({ libraryPathResolved: "C:\\lib", useFileDrop: true, closeAfterInsert: false, panelEntry: true, dedupe: true }));
 mk("setConfig", (p) => ({ libraryPathResolved: "C:\\lib", closeAfterInsert: false, panelEntry: true, ...p }));
 mk("list", () => LIB);
 mk("stats", () => ({ count: LIB.length, bytes: 3584, libraryPath: "C:\\lib" }));
@@ -210,6 +210,18 @@ mk("pasteFile", (name) =>
 );
 mk("pastePng", () => ({ ok: true, size: { width: 32, height: 32, bytes: 4 } }));
 mk("startDrag", () => ({ ok: true }));
+// ★ 动图走「文件 URI」方式：模拟 QQ 插入 <msg-img data-url="真实路径">，
+// 这样 waitForEditorChange 才能检测到变化（真实的 QQ 就是这么插入的）
+mk("prepareDrop", () => ({ ok: true, cached: false }));
+mk("pasteFileAsDrop", (name) => {
+    const ed = doc.querySelector(".ck.ck-content.ck-editor__editable");
+    if (ed) {
+        ed.innerHTML =
+            '<p><msg-img class="editor-el--inline-block ck-widget" contenteditable="false" draggable="true">' +
+            '<img class="editor-el__pic" data-url="D:\\lib\\' + name + '" src="appimg://D:/lib/x.gif"></msg-img></p>';
+    }
+    return { ok: true };
+});
 mk("chooseLibrary", () => ({ ok: true, libraryPath: "D:\\newlib" }));
 mk("openLibrary", () => ({ ok: true }));
 mk("reveal", () => ({ ok: true }));
@@ -454,7 +466,7 @@ try {
     produced.length >= 10 ? ok(`自检产出了 ${produced.length} 行报告`) : bad(`自检输出不足: ${produced.length} 行`);
     logLines.some((l) => l.includes("local:// fetch 测试: ok=true")) ? ok("自检实测了 local:// 协议且成功") : bad("自检里的 local:// 测试没成功");
     logLines.some((l) => l.includes("SELF-TEST END")) ? ok("自检正常收尾") : bad("自检没有收尾标记");
-    produced.some((l) => l.includes("window.sticker_box: 20 个方法")) ? ok("自检确认 20 个 API 方法都在") : bad("自检没确认到 API（方法数应为 20）");
+    produced.some((l) => l.includes("window.sticker_box: 22 个方法")) ? ok("自检确认 22 个 API 方法都在") : bad("自检没确认到 API（方法数应为 22）");
 } catch (e) {
     bad("设置页执行抛异常: " + e.message);
 }
@@ -486,6 +498,103 @@ apiCalls.filter((c) => c.name === "readFile").length > beforeRead
 apiCalls.filter((c) => c.name === "pastePng").length > beforePng ? ok("转成 PNG 后走 pastePng 通道") : bad("没有调用 pastePng");
 logLines.some((l) => l.includes("改用 canvas 转静态 PNG")) ? ok("日志记录了降级动作") : bad("日志没记录降级");
 pasteFileUnsupported = false;
+
+console.log("\n== 10b) 动图走「文件 URI」路径（保留动画的关键） ==");
+try {
+    // 库里本来就有 表情B.gif，不用另造
+    doc.querySelector(".sb-panel")?.remove();
+    doc.querySelector(".sb-bar-icon")?.dispatchEvent(new window.MouseEvent("click", { bubbles: true }));
+    await sleep(400);
+
+    const cells = [...doc.querySelectorAll(".sb-item")];
+    const gifCell = cells.find((c) => (c.dataset.name || "").endsWith(".gif"));
+    gifCell ? ok("面板里出现了动图格子") : bad("没找到动图格子，现有: " + cells.map((c) => c.dataset.name).join(","));
+
+    const beforeUri = apiCalls.filter((c) => c.name === "pasteFileAsDrop").length;
+    if (gifCell) {
+        gifCell.dispatchEvent(new window.MouseEvent("click", { bubbles: true }));
+        await sleep(600);
+        const uriCalls = apiCalls.filter((c) => c.name === "pasteFileAsDrop");
+        uriCalls.length > beforeUri
+            ? ok("点击动图调用了 pasteFileAsDrop（真 CF_HDROP，而不是图片剪贴板）")
+            : bad("动图没有走 CF_HDROP 方式");
+        const uc = uriCalls[uriCalls.length - 1];
+        uc && String(uc.args[0]).toLowerCase().endsWith(".gif") ? ok("传的确实是动图: " + uc.args[0]) : bad("传的文件不对: " + (uc && uc.args[0]));
+        logLines.some((l) => l.includes("CF_HDROP")) ? ok("日志记录了 CF_HDROP 路径") : bad("日志没记录 CF_HDROP");
+        doc.querySelector(".ck-content")?.innerHTML.includes("msg-img")
+            ? ok("编辑器里出现了 QQ 的 msg-img（说明按文件处理，动画可保留）")
+            : bad("编辑器里没有 msg-img");
+    }
+} catch (e) {
+    bad("10b 抛异常: " + e.message);
+}
+console.log("\n== 10c) 扩展名是 .jpg 但 animated=true，也必须走文件上传 ==");
+try {
+    // 这正是用户遇到的情况：QQ 缓存把真身 GIF89a 存成了 xxx.jpg
+    LIB.push({
+        name: "伪装成jpg的动图.jpg",
+        size: 3397075,
+        mtime: Date.now(),
+        addedAt: Date.now() + 1000,
+        url: "local:///D:/lib/disguised.jpg",
+        filePath: "D:\\lib\\disguised.jpg",
+        kind: "gif",
+        animated: true
+    });
+    doc.querySelector(".sb-panel")?.remove();
+    doc.querySelector(".sb-bar-icon")?.dispatchEvent(new window.MouseEvent("click", { bubbles: true }));
+    await sleep(400);
+
+    const cell = [...doc.querySelectorAll(".sb-item")].find((c) => c.dataset.name === "伪装成jpg的动图.jpg");
+    cell ? ok("面板里出现了这个伪装扩展名的文件") : bad("没找到它");
+
+    const before = apiCalls.filter((c) => c.name === "pasteFileAsDrop").length;
+    const beforePng = apiCalls.filter((c) => c.name === "pastePng").length;
+    if (cell) {
+        cell.dispatchEvent(new window.MouseEvent("click", { bubbles: true }));
+        await sleep(700);
+        const after = apiCalls.filter((c) => c.name === "pasteFileAsDrop").length;
+        const afterPng = apiCalls.filter((c) => c.name === "pastePng").length;
+        after > before ? ok("走的是 pasteFileAsDrop（按文件填入，动画保留）") : bad("没有走文件上传路径");
+        afterPng === beforePng ? ok("没有退化成静态 PNG") : bad("仍然退化成了静态 PNG");
+        cell.dataset.anim === "true" ? ok("格子带上了动图角标") : bad("格子没有动图角标");
+    }
+} catch (e) {
+    bad("10c 抛异常: " + e.message);
+}
+
+console.log("\n== 10d) ★ 默认必须关闭文件剪贴板路径（回退的保证） ==");
+{
+    // 背景：这条路能让动图保住动画，但实测会让 QQ 在发送后卡死
+    // （无法交互、托盘退不掉、只能任务管理器）。所以默认关闭，只留开关。
+    const src = fs.readFileSync(new URL("../renderer.js", import.meta.url), "utf8");
+    const guarded = src.match(/if \(isAnim && config\.useFileDrop === true\)/g) || [];
+    guarded.length >= 2
+        ? ok(`文件剪贴板路径 + 悬停预填都受 config.useFileDrop 开关保护（${guarded.length} 处）`)
+        : bad(`只有 ${guarded.length} 处受保护，应该有 2 处（插入 + 悬停预填）`);
+
+    // 不能再出现"无条件调用 pasteFileAsDrop"的写法
+    /if \(isAnim\) \{\s*\n\s*const t0 = Date\.now\(\);/.test(src)
+        ? bad("还有无条件的 pasteFileAsDrop 调用！")
+        : ok("没有无条件的 pasteFileAsDrop 调用");
+
+    // 源码里不能有任何地方把 useFileDrop 默认写成 true
+    // （useFileDrop: true 只允许出现在测试自己的 mock 里，不在 renderer.js 里）
+    /useFileDrop:\s*true/.test(src)
+        ? bad("renderer.js 里把 useFileDrop 默认打开了！")
+        : ok("renderer.js 没有默认开启 useFileDrop");
+
+    // 默认配置里也不能有它
+    const mainSrc = fs.readFileSync(new URL("../main.js", import.meta.url), "utf8");
+    const defMatch = mainSrc.match(/DEFAULT_CONFIG\s*=\s*\{[\s\S]{0,600}?\};/);
+    if (defMatch) {
+        /useFileDrop/.test(defMatch[0])
+            ? bad("DEFAULT_CONFIG 里出现了 useFileDrop，默认值必须是不存在/false")
+            : ok("DEFAULT_CONFIG 里没有 useFileDrop（默认即关闭）");
+    } else {
+        ok("找不到 DEFAULT_CONFIG，跳过该项");
+    }
+}
 
 console.log("\n== 11) 关掉开关会摘掉工具栏星标 ==");
 const swPanel = view.querySelector("#sb-panel-entry");

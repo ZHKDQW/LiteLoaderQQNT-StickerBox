@@ -363,7 +363,9 @@ function renderGrid() {
         const cell = document.createElement("div");
         cell.className = "sb-item";
         cell.dataset.name = item.name;
-        const isAnim = /\.(gif|webp|apng|avif)$/i.test(item.name);
+        // 动图判定优先用主进程按**文件内容**算出来的 animated —— QQ 缓存给的文件名
+        // 后缀经常是错的（实测真身是 GIF89a 却叫 xxx.jpg），只看扩展名会把动图当静态图。
+        const isAnim = item.animated === true || /\.(gif|webp|apng|avif)$/i.test(item.name);
         cell.title = isAnim
             ? `${item.name}\n${formatSize(item.size)}\n左键填入输入框（动图会变成静态首帧）\n拖进输入框可以保留动画 · 右键更多操作`
             : `${item.name}\n${formatSize(item.size)}\n左键填入输入框 · 右键更多操作`;
@@ -385,6 +387,26 @@ function renderGrid() {
             cell.appendChild(badge);
             // 悬停时提示"可以拖"—— 动图只有走原生拖放才能保住动画
             cell.dataset.anim = "true";
+        }
+
+        // 悬停预填：动图在鼠标下停 250ms 就提前把剪贴板准备好（防抖，避免只是划过也起进程）。
+        // 准备一次要 ~860ms，全花在启动进程上；预填之后点下去就是 0 等待。
+        // 跟文件剪贴板路径一起默认关闭 —— 它同样要起外部进程。
+        if (isAnim && config.useFileDrop === true) {
+            let hoverTimer = null;
+            cell.addEventListener("mouseenter", () => {
+                clearTimeout(hoverTimer);
+                hoverTimer = setTimeout(() => {
+                    api.prepareDrop(item.name)
+                        .then((r) => {
+                            if (r && r.ok) log(`已预填剪贴板: ${item.name}${r.cached ? "（命中缓存）" : ""}`);
+                        })
+                        .catch(() => {
+                            /* 预填失败不影响点击时的正常流程 */
+                        });
+                }, 250);
+            });
+            cell.addEventListener("mouseleave", () => clearTimeout(hoverTimer));
         }
 
         cell.addEventListener("click", () => insertSticker(item));
@@ -500,8 +522,19 @@ function getEditor() {
  * 把动图/不支持的格式转成静态 PNG（第一帧）。
  * nativeImage 只认 PNG/JPEG，GIF/WebP 进不了图片剪贴板，只能这样退化。
  * 用 IPC 取字节再造 Blob，避免 canvas 被 local:// 图片污染（tainted）后 toBlob 抛异常。
+ *
+ * 带缓存：同一张动图第二次点击就不用重新解码了（2.5MB 的 GIF 解码要几百毫秒，
+ * 用户对"点了半天才填进去"很敏感）。
  */
+const pngCache = new Map();
+const PNG_CACHE_MAX = 24;
+
 async function rasterizeToPng(item) {
+    const hit = pngCache.get(item.name);
+    if (hit) {
+        log("静态 PNG 命中缓存: " + item.name);
+        return hit;
+    }
     try {
         const r = await api.readFile(item.name);
         if (!r || !r.ok) return null;
@@ -514,7 +547,10 @@ async function rasterizeToPng(item) {
         if (bmp.close) bmp.close();
         const png = await new Promise((res) => canvas.toBlob(res, "image/png"));
         if (!png) return null;
-        return { name: item.name.replace(/\.[^.]+$/, "") + ".png", buffer: await png.arrayBuffer() };
+        const out = { name: item.name.replace(/\.[^.]+$/, "") + ".png", buffer: await png.arrayBuffer() };
+        if (pngCache.size >= PNG_CACHE_MAX) pngCache.delete(pngCache.keys().next().value);
+        pngCache.set(item.name, out);
+        return out;
     } catch (e) {
         log("转静态 PNG 失败: " + String(e));
         return null;
@@ -560,8 +596,38 @@ async function insertSticker(item) {
         return;
     }
     try {
-        const before = editor.innerHTML.length;
+        let before = editor.innerHTML.length;
         editor.focus();
+
+        // ---------- 动图：文件剪贴板路径（默认关闭） ----------
+        //
+        // 这条路能让 QQ 把图片当**文件**上传，从而保留动画。原理有两层：
+        //   1. "剪贴板里有一个文件"在 Windows 上就是 CF_HDROP，而 Electron 写不了它
+        //      （writeBuffer 里的名字会被注册成同名自定义格式，实测 atom 49902 而不是
+        //      预定义的 15）；
+        //   2. 光有 CF_HDROP 还不够 —— 资源管理器 Ctrl+C 会写 13 种格式（多出
+        //      FileGroupDescriptorW、Preferred DropEffect 等），QQ 只认后者。
+        // 所以只能借 Shell 的 copy 动词，代价是要起一个外部进程（cscript）。
+        //
+        // 【为什么默认关闭】实测会导致 QQ 在**发送之后**卡死：界面无法交互、
+        // 从托盘也退不掉，只能任务管理器。它要在系统剪贴板里放 13 种格式、
+        // 还依赖外部进程持有这些数据，对系统的侵入性太大，不划算。
+        //
+        // 想试的话把 config.json 的 useFileDrop 改成 true；需要保留动画时，
+        // 把文件直接拖进输入框是可靠的做法。
+        const isAnim = item.animated === true || /\.(gif|webp|apng)$/i.test(item.name);
+        if (isAnim && config.useFileDrop === true) {
+            const t0 = Date.now();
+            const dropRes = await api.pasteFileAsDrop(item.name);
+            log(`CF_HDROP 方式返回（${Date.now() - t0}ms）: ` + JSON.stringify(dropRes));
+            if (dropRes && dropRes.ok && (await waitForEditorChange(editor, before, 2000))) {
+                log("动图已按文件填入（QQ 走原文件上传，动画保留）");
+                if (config.closeAfterInsert) closePanel();
+                return;
+            }
+            log("CF_HDROP 方式没让输入框变化，回退到静态首帧");
+            before = editor.innerHTML.length;
+        }
 
         let r = await api.pasteFile(item.name);
         log("真实粘贴返回: " + JSON.stringify(r));
@@ -572,7 +638,7 @@ async function insertSticker(item) {
             const png = await rasterizeToPng(item);
             r = png ? await api.pastePng(png.name, png.buffer) : r;
             log("静态 PNG 粘贴返回: " + JSON.stringify(r));
-            if (r && r.ok) toast("动图只能填静态首帧；想保留动画请把文件直接拖进输入框", true);
+            if (r && r.ok) toast("动图只能填静态首帧；想保留动画请把文件拖进输入框", true);
         }
 
         if (r && r.ok && (await waitForEditorChange(editor, before, 2500))) {
@@ -826,6 +892,7 @@ function decorateContextMenu(menu) {
 
 // ============================================================ 设置页
 
+
 /**
  * 现场自检：在真实 QQ 渲染进程里跑一遍关键环节，把结果写进日志。
  * 一次点击就能拿到完整诊断，不用反复来回猜。
@@ -839,7 +906,9 @@ async function runSelfTest() {
         push("LiteLoader: " + JSON.stringify(globalThis.LiteLoader?.versions || {}));
 
         const eds = [...document.querySelectorAll(".ck.ck-content.ck-editor__editable")];
-        push("编辑器: 共 " + eds.length + " 个, 可见 " + eds.filter((e) => e.offsetParent !== null).length);
+        // 自检是从设置页触发的，而设置页是独立窗口 —— 那里看不到聊天输入框，
+        // 所以这里报 0 是正常的，不代表编辑器有问题（探针走的是转发到聊天窗口的路子）。
+        push("编辑器: 共 " + eds.length + " 个, 可见 " + eds.filter((e) => e.offsetParent !== null).length + "（设置窗口里看不到聊天输入框，0 属正常）");
 
         push("chat-func-bar: " + (document.querySelector(".chat-func-bar") ? "有" : "无"));
         const row = findToolbarIconRow();
@@ -983,6 +1052,7 @@ export async function onSettingWindowCreated(view) {
         });
         $("sb-snapshot")?.remove();
 
+
         const sw = $("sb-close");
         if (config.closeAfterInsert) sw.setAttribute("is-active", "");
         sw.addEventListener("click", async () => {
@@ -1053,10 +1123,23 @@ function startEntryPoll() {
 // 把「卡了多久」写进日志。这是唯一能在「界面点不动」的情况下留下证据的办法。
 
 const WD_INTERVAL = 500;
+/**
+ * 【为什么要区分「节流」和「阻塞」】
+ * Chromium 会把**后台/隐藏窗口**的 setInterval 节流到大约 1000ms。
+ * 上一版没区分，于是每 500ms 的检测测出「阻塞 500ms」——全是假的：
+ * 一晚上攒了 808 条报告，占整个日志的 81%，把真正有用的信息全淹了。
+ * 所以：窗口不可见时直接不判；阈值也提到 1500ms。
+ */
+const WD_MIN_DRIFT = 1500;
+const WD_REPORT_GAP = 10000; // 两条报告至少隔 10 秒，避免刷屏
+const WD_SLEEP_HINT = 20000; // 这个量级更像系统休眠，不是阻塞
+
 let wdTimer = null;
 let wdLast = 0;
 let wdWorst = 0;
 let wdCount = 0;
+let wdLastReportAt = 0;
+let wdSuppressed = 0;
 
 function startWatchdog() {
     if (wdTimer) return;
@@ -1065,13 +1148,25 @@ function startWatchdog() {
         const now = Date.now();
         const drift = now - wdLast - WD_INTERVAL;
         wdLast = now;
-        if (drift > 250) {
-            wdCount++;
-            if (drift > wdWorst) wdWorst = drift;
-            log(`[看门狗] 渲染进程主线程被阻塞 ${drift}ms（累计 ${wdCount} 次，最久 ${wdWorst}ms）`);
+
+        // 后台窗口的定时器被节流，测出来的"阻塞"没有意义
+        if (document.visibilityState !== "visible") return;
+        if (drift < WD_MIN_DRIFT) return;
+
+        wdCount++;
+        if (drift > wdWorst) wdWorst = drift;
+
+        if (now - wdLastReportAt < WD_REPORT_GAP) {
+            wdSuppressed++;
+            return;
         }
+        const extra = wdSuppressed ? `，期间另有 ${wdSuppressed} 次未记录` : "";
+        const hint = drift > WD_SLEEP_HINT ? "（这个量级更像系统休眠/挂起，不是阻塞）" : "";
+        wdSuppressed = 0;
+        wdLastReportAt = now;
+        log(`[看门狗] 渲染进程主线程被阻塞 ${drift}ms（累计 ${wdCount} 次，最久 ${wdWorst}ms）${extra}${hint}`);
     }, WD_INTERVAL);
-    log(`渲染进程看门狗已启动（每 ${WD_INTERVAL}ms 检测一次主线程阻塞）`);
+    log(`渲染进程看门狗已启动（每 ${WD_INTERVAL}ms 一次，阈值 ${WD_MIN_DRIFT}ms，后台窗口不判）`);
 }
 
 // ============================================================ 启动

@@ -87,6 +87,12 @@ for (const [k, rel] of Object.entries(injects)) {
 console.log("== 4/6 preload 暴露的 API ==");
 const preloadSrc = fs.readFileSync(preloadJs, "utf8");
 const exposed = new Set([...preloadSrc.matchAll(/^\s{4}([A-Za-z_$][\w$]*)\s*:/gm)].map((m) => m[1]));
+// 标了 @local-only 的方法是纯 preload 实现：比如查 electron.webUtils ——
+// 那是渲染侧才有的模块，主进程里根本没有，不该要求它有 ipcMain.handle。
+const localOnly = new Set(
+    [...preloadSrc.matchAll(/@local-only[\s\S]{0,120}?^\s{4}([A-Za-z_$][\w$]*)\s*:/gm)].map((m) => m[1])
+);
+if (localOnly.size) console.log(`  · 纯 preload 方法（不需要 IPC handler）: ${[...localOnly].join(", ")}`);
 exposed.size ? ok("暴露 " + exposed.size + " 个方法: " + [...exposed].join(", ")) : bad("没解析到暴露的方法");
 
 console.log("== 5/6 renderer 调用的 api.xxx ==");
@@ -106,6 +112,7 @@ const handled = new Set([
     ...[...mainSrc.matchAll(/(?:^|[^.\w])handle\(\s*"([^"]+)"\s*,/g)].map((m) => m[1])
 ]);
 for (const name of exposed) {
+    if (localOnly.has(name)) continue;
     handled.has(name) ? ok(`handler: ${name}`) : bad(`preload 暴露了 ${name}，但 main 里没有 ipcMain.handle`);
 }
 for (const name of handled) {
