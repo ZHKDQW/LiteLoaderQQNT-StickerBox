@@ -610,11 +610,29 @@ async function insertSticker(item) {
 
 // ============================================================ 右键菜单：存入本地
 
+/**
+ * 极简模式（config.liteMode）：什么都不主动做，只留一句日志。
+ * 用来二分 —— 如果连这个都卡，问题就在插件加载本身而不是某个功能。
+ */
+const LITE = config.liteMode === true;
+/**
+ * 右键菜单开关。关掉后不再往 document 上注册 mousedown / contextmenu 监听，
+ * 代价是失去「右键聊天消息 → 存入本地表情库」，其他功能不受影响。
+ *
+ * 【为什么要这个开关】排查"碰天气栏必卡"时发现：卡死瞬间插件没有任何日志
+ * （说明它没执行代码），但禁用插件就不卡、且不插星标也还卡 ——
+ * 嫌疑就落在注册到 document 上的这两个捕获阶段监听器上。
+ */
+const CTX_ON = config.enableContextMenu !== false;
+if (LITE) log("⚠ liteMode 已开启：跳过右键菜单 / 看门狗 / 入口轮询 / 窗口唤活 / 工具栏星标");
+
 let ctxTarget = null;
 let ctxPoint = null;
 let ctxTimer = null;
 
-document.addEventListener(
+function installContextMenu() {
+    if (!CTX_ON) return;
+    document.addEventListener(
     "mousedown",
     (e) => {
         if (e.button !== 2) {
@@ -628,7 +646,7 @@ document.addEventListener(
     true
 );
 
-document.addEventListener(
+if (!LITE && CTX_ON) document.addEventListener(
     "contextmenu",
     (e) => {
         if (!ctxTarget) {
@@ -639,6 +657,7 @@ document.addEventListener(
     },
     true
 );
+}
 
 function findVisibleContextMenu() {
     const list = [...document.querySelectorAll(".q-context-menu")];
@@ -651,6 +670,7 @@ function findVisibleContextMenu() {
 }
 
 function watchContextMenu() {
+    if (!CTX_ON) return;
     if (ctxTimer) clearInterval(ctxTimer);
     let n = 0;
     ctxTimer = setInterval(() => {
@@ -1120,49 +1140,130 @@ function startWatchdog() {
 }
 
 // ============================================================ 启动
+//
+// ★★★ 这里刻意**一次 IPC 都不发**（连 log 都不发）★★★
+//
+// 实测机制：鼠标碰到 QQ 右上角的天气栏时，QQ 会显示一个标题为「天气」的独立
+// BrowserWindow（枚举窗口能看到 HWND 0x80A3A、322x252、class Chrome_WidgetWin_1）。
+// 显示期间主进程被某个同步调用占住 —— 日志证据：它的 Node 事件循环停住 135 秒
+// 没写一个字，但 CPU 是 0%、112 个线程全在 Wait、窗口 Responding=True，
+// 这是"等一个同步调用返回"的典型特征。
+//
+// 而新窗口 = 新的渲染环境，LiteLoader 会把本文件注入进去。如果这里在脚本执行的
+// 第一刻就 `await api.getConfig()`，就会和正忙的主进程**互等**：它等同步调用，
+// 我们等它回 IPC，谁都不动 —— 整个 QQ 定格，点不动、最小化不了、托盘也退不掉。
+// 禁用插件就不卡，正是因为"互等的另一方"不存在了。
+//
+// 所以改成两段式：先用**纯本地**手段（查 DOM）确认这是真正的聊天窗口，
+// 确认之后才碰 IPC。判断期间主进程忙不忙都与我们无关。
+
+// 环境特征：纯本地读取，不发 IPC。等确认是聊天窗口时再随日志一起发出去。
+const bootEnv = (() => {
+    try {
+        return {
+            url: String(location.href).slice(0, 160),
+            proto: location.protocol,
+            isTop: window.top === window,
+            hasChatFuncBar: !!document.querySelector(".chat-func-bar"),
+            hasMsgList: !!document.querySelector(".ml-list"),
+            hasQQApp: !!document.querySelector("#app, .qq-app, .main-window"),
+            bodyChildren: document.body ? document.body.children.length : -1,
+            readyState: document.readyState
+        };
+    } catch (e) {
+        return { err: String(e) };
+    }
+})();
 
 (async () => {
-    try {
-        config = { ...config, ...(await api.getConfig()) };
-        log("渲染进程就绪，插件目录: " + PLUGIN_DIR);
-        ensureToolbarEntry();
+    let inited = false;
+
+    const boot = async () => {
+        if (inited) return;
+        // ★ 纯本地判断：出现聊天工具栏，才认为这是真正的聊天窗口。
+        // 登录窗 / blank 窗口 / hiddenWindow / 天气卡片都不会有它。
+        if (!document.querySelector(".chat-func-bar")) return;
+        inited = true;
+        clearInterval(gateTimer);
+
+        // ★ 到这里才碰 IPC —— QQ 的窗口已经就绪，主进程不忙，不会互等
+        try {
+            config = { ...config, ...(await api.getConfig()) };
+        } catch (e) {
+            /* 拿不到配置就用默认值，绝不能因此卡住 */
+        }
+        log("渲染进程就绪 " + JSON.stringify(bootEnv));
+
+        // ---------- 渐进启用（诊断用） ----------
+        if (config.diagnoseSteps === true) {
+            const steps = [
+                ["渲染看门狗", () => startWatchdog()],
+                ["入口轮询（只维护星标）", () => startEntryPoll()],
+                ["工具栏星标注入", () => ensureToolbarEntry()],
+                [
+                    "可见性唤活（invalidate+focus）",
+                    () => {
+                        document.addEventListener("visibilitychange", () => {
+                            if (document.visibilityState !== "visible") return;
+                            if (config.wakeOnRestore === false) return;
+                            setTimeout(() => {
+                                api.wakeWindow()
+                                    .then((r) => {
+                                        if (r && r.ok) log("恢复可见，已尝试唤活窗口（" + (r.done || []).join("+") + "）");
+                                    })
+                                    .catch(() => {});
+                            }, 800);
+                        });
+                    }
+                ],
+                ["右键菜单监听", () => installContextMenu()],
+                ["全部启用完成", () => {}]
+            ];
+            let idx = 0;
+            const runNext = () => {
+                if (idx >= steps.length) return;
+                const name = steps[idx][0];
+                const fn = steps[idx][1];
+                idx++;
+                log(`[诊断] 第 ${idx}/${steps.length} 步：即将启用「${name}」`);
+                try {
+                    fn();
+                    log(`[诊断] 第 ${idx}/${steps.length} 步：「${name}」已启用`);
+                } catch (e) {
+                    log(`[诊断] 第 ${idx}/${steps.length} 步：「${name}」启用失败 ` + String(e));
+                }
+                setTimeout(runNext, 12000);
+            };
+            log("[诊断] 渐进启用模式：每 12 秒打开一个功能，请在每步之后碰一下天气栏");
+            setTimeout(runNext, 6000);
+        } else if (!LITE) {
+            ensureToolbarEntry();
+            installContextMenu();
+        }
 
         // ---------- 最小化恢复后唤活界面 ----------
-        //
-        // Chromium 在 Windows 上有个存在多年的已知问题：窗口从最小化恢复后，界面看着
-        // 完全正常，但**点哪里都没反应**（鼠标没冻结，最大化/最小化本身也正常）。
-        // QQNT、VS Code、Chrome、Edge 都有人报告同样症状（microsoft/vscode#167556），
-        // 根因指向 Chromium 的 GPU 渲染管线 —— 也正因为卡在那一层，插件的看门狗
-        // 测不到它（主进程事件循环只记录到 253ms，看起来一切正常）。
-        //
-        // 社区 workaround 是在输入框里右键 → 粘贴任意字符，本质是**给窗口一个输入事件**
-        // 把它从假死里唤醒。这里在恢复可见时自动做一次等价操作：强制重绘 + 聚焦。
-        document.addEventListener("visibilitychange", () => {
-            if (document.visibilityState !== "visible") return;
-            if (config.wakeOnRestore === false) return;
-            // 等 Chromium 把恢复流程走完再戳，太早没有意义
-            setTimeout(() => {
-                api.wakeWindow()
-                    .then((r) => {
-                        if (r && r.ok) log("恢复可见，已尝试唤活窗口（" + (r.done || []).join("+") + "）");
-                    })
-                    .catch(() => {
-                        /* 唤活失败不影响任何功能 */
-                    });
-            }, 800);
-        });
+        if (!LITE) {
+            document.addEventListener("visibilitychange", () => {
+                if (document.visibilityState !== "visible") return;
+                if (config.wakeOnRestore === false) return;
+                setTimeout(() => {
+                    api.wakeWindow()
+                        .then((r) => {
+                            if (r && r.ok) log("恢复可见，已尝试唤活窗口（" + (r.done || []).join("+") + "）");
+                        })
+                        .catch(() => {
+                            /* 唤活失败不影响任何功能 */
+                        });
+                }, 800);
+            });
+        }
 
-        // 只在聊天窗口里跑轮询，免得登录窗/设置窗白跑
-        const gate = () => {
-            if (document.querySelector(".chat-func-bar")) {
-                clearInterval(gateTimer);
-                startEntryPoll();
-                startWatchdog();
-            }
-        };
-        const gateTimer = setInterval(gate, 1000);
-        gate();
-    } catch (e) {
-        log("启动失败: " + String(e));
-    }
+        if (LITE) return;
+        startEntryPoll();
+        startWatchdog();
+    };
+
+    // 轮询等聊天工具栏出现。查 DOM 是本地操作，不发 IPC。
+    const gateTimer = setInterval(boot, 1000);
+    boot();
 })();

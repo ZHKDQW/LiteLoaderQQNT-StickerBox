@@ -78,7 +78,31 @@ const defaultConfig = {
      * （QQNT / VS Code / Chrome / Edge 都有报告，见 microsoft/vscode#167556）。
      * 这里做的只是强制重绘 + 聚焦，无害；治不了根，但可能省掉一次任务管理器。
      */
-    wakeOnRestore: true
+    wakeOnRestore: true,
+    /**
+     * 极简模式：只保留 preload 的 API 暴露、主进程 IPC 注册和日志，
+     * 关掉右键菜单注入、看门狗、入口轮询、窗口唤活、工具栏星标。
+     *
+     * 用途是**二分定位**：插件被确认是卡死的原因，但逐个关功能太慢
+     * （每关一个都要重启 QQ），所以留一个"什么都不做"的档位 ——
+     * 如果连它都卡，问题就在插件加载本身，而不是某个具体功能。
+     */
+    liteMode: false,
+    /**
+     * 是否启用「右键聊天消息 → 存入本地表情库」。
+     *
+     * 关掉后不再往 document 上注册 mousedown / contextmenu 监听，
+     * 那条存表情的入口会消失，但面板、点击填入、拖拽都不受影响。
+     * 排查"碰天气栏必卡"用的开关。
+     */
+    enableContextMenu: true,
+    /**
+     * 渐进启用（诊断用）：启动后每 12 秒打开一个功能，而不是一次全开。
+     * 配合"碰天气栏必卡"这个稳定复现，一次启动就能定位到具体是哪个功能。
+     * 诊断模式下日志改为同步写 —— 卡死时异步缓冲可能没落盘，
+     * 而"最后启用了什么"正是最关键的证据。
+     */
+    diagnoseSteps: false
 };
 
 let config = { ...defaultConfig };
@@ -173,9 +197,15 @@ function log(...args) {
         if (line.length > LOG_MAX_LINE) {
             line = `${line.slice(0, LOG_MAX_LINE)}…[整行超长已截断，原长 ${line.length} 字符]\n`;
         }
-        const s = ensureLogStream();
-        // stream.write 是异步的：只进内存缓冲，不等磁盘
-        if (s) s.write(line);
+        if (config.diagnoseSteps === true) {
+            // ★ 诊断模式：同步写。异步缓冲在进程被冻结时可能丢内容，
+            // 而"卡死前最后一行"恰恰是唯一有价值的线索。
+            fs.appendFileSync(logPath, line, "utf8");
+        } else {
+            const s = ensureLogStream();
+            // stream.write 是异步的：只进内存缓冲，不等磁盘
+            if (s) s.write(line);
+        }
         scheduleRotationCheck();
     } catch (e) {
         /* 日志失败不能影响主流程 */
@@ -276,7 +306,17 @@ function startWatchdog() {
 
 function loadJson(file, fallback) {
     try {
-        if (fs.existsSync(file)) return JSON.parse(fs.readFileSync(file, "utf8"));
+        if (!fs.existsSync(file)) return fallback;
+        let text = fs.readFileSync(file, "utf8");
+        // ★ 剥掉 BOM。PowerShell 5.1 的 Set-Content -Encoding UTF8 会写入 U+FEFF，
+        // 而 JSON.parse 遇到它会直接抛 "Unexpected token"，**整份配置被丢弃、全部退回默认值**。
+        // 这个坑实测中招 9 次：用户改的 panelEntry / liteMode / diagnoseSteps 全都没生效，
+        // 导致一整轮排查建立在错误的前提上。这里主动容错，别再让它发生。
+        if (text.charCodeAt(0) === 0xfeff) {
+            log("配置带 BOM，已自动剥离:", file);
+            text = text.slice(1);
+        }
+        return JSON.parse(text);
     } catch (e) {
         log("读取失败", file, String(e));
     }
@@ -1160,7 +1200,7 @@ function onLoad() {
         log("读取 LiteLoader 版本信息失败: " + String(e));
     }
 
-    startWatchdog();
+    if (config.liteMode !== true && config.diagnoseSteps !== true) startWatchdog();
 
     // 日志是流式异步写的，退出前给它一次 flush 的机会。
     // （异步写的代价就是强杀时可能丢最后几行，这里尽量兜一下。）
