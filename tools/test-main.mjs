@@ -89,7 +89,7 @@ function writeSrc(name, buf) {
 
 console.log("== 1) main.js 加载 ==");
 Object.keys(mainExports || {}).length >= 0 ? ok("模块加载成功，导出 " + Object.keys(mainExports || {}).length + " 个键") : bad("导出异常");
-eq(H.size, 22, "注册了 22 个 ipc handler");
+eq(H.size, 20, "注册了 20 个 ipc handler");
 
 console.log("\n== 2) 初始配置 ==");
 const cfg0 = await call("getConfig");
@@ -424,93 +424,6 @@ console.log("\n== 19) 按内容识别动图（QQ 缓存的文件名后缀不可�
     hit3 && hit3.kind === "gif" && hit3.animated === true ? ok("扩展名正确时也正常识别") : bad("正常情况反而识别失败");
 }
 
-
-console.log("\n== 20) 剪贴板脚本端到端：真的执行插件生成的那份 VBS ==");
-{
-    // 上一版就是栽在这里：脚本内容里有中文注释，却用 ascii 编码写文件，
-    // 中文被切碎后有的碎片正好是换行符，cscript 直接报语法错误。
-    // 而我当时"自测通过"是因为测的是手写的另一份脚本 —— 这次直接测插件生成的那份。
-    const libDir = (await call("stats")).libraryPath;
-    fs.mkdirSync(libDir, { recursive: true });
-    const target = "clip-e2e.gif";
-    fs.writeFileSync(
-        path.join(libDir, target),
-        Buffer.concat([Buffer.from("GIF89a", "ascii"), Buffer.from([0xf0, 1, 0xf0, 1, 0xf7, 0]), Buffer.alloc(400, 0x41)])
-    );
-
-    const t0 = Date.now();
-    const r = await call("prepareDrop", target);
-    const ms = Date.now() - t0;
-    r && r.ok
-        ? ok(`prepareDrop 成功（${ms}ms）→ 插件生成的 VBS 能被 cscript 正常执行`)
-        : bad(`prepareDrop 失败：${JSON.stringify(r)}（多半是生成的 VBS 语法有问题）`);
-
-    const tempDir = process.env.SB_MOCK_TEMP || path.join(SANDBOX, "temp");
-    const vbsPath = path.join(tempDir, "sb-clip-hold.vbs");
-    if (fs.existsSync(vbsPath)) {
-        const buf = fs.readFileSync(vbsPath);
-        const badBytes = [...buf].filter((b) => b > 127);
-        badBytes.length === 0
-            ? ok("生成的 VBS 是纯 ASCII（不会被 ascii 编码写坏）")
-            : bad(`VBS 里有 ${badBytes.length} 个非 ASCII 字节 —— 这会让 cscript 报语法错误`);
-        const txt = buf.toString("ascii");
-        txt.includes("WScript.Sleep 1000") ? ok("Sleep 用的是循环，避开了 32767 溢出") : bad("Sleep 那段不对");
-        /[\r\n]\s*'/.test(txt) || txt.includes("Option Explicit") ? ok("脚本结构完整（有 Option Explicit）") : bad("脚本结构看起来不完整");
-        const lines = txt.split(/\r?\n/);
-        lines.length >= 20 ? ok(`脚本共 ${lines.length} 行`) : bad(`脚本只有 ${lines.length} 行，可能被截断了`);
-    } else {
-        bad("VBS 没有生成到 " + vbsPath);
-    }
-
-    // 清理持有进程（它会 Sleep 60 秒）
-    try {
-        execSync('taskkill /F /IM cscript.exe', { stdio: "ignore", windowsHide: true });
-        ok("已清理测试留下的持有进程");
-    } catch (e) {
-        ok("没有残留的 cscript 进程");
-    }
-}
-
-
-console.log("\n== 21) 剪贴板队列：并发调用必须排队，不能互相拒绝 ==");
-{
-    // 上一版写的是 if (clipBusy) return false —— 悬停预填还在跑的时候点击会立刻失败，
-    // 用户看到的就是"回退到静态首帧"，而且日志里 8ms 就返回了。
-    const libDir = (await call("stats")).libraryPath;
-    const a = "queue-a.gif";
-    const b = "queue-b.gif";
-    const bytes = Buffer.concat([
-        Buffer.from("GIF89a", "ascii"),
-        Buffer.from([0xf0, 1, 0xf0, 1, 0xf7, 0]),
-        Buffer.alloc(300, 0x41)
-    ]);
-    fs.writeFileSync(path.join(libDir, a), bytes);
-    fs.writeFileSync(path.join(libDir, b), bytes);
-
-    const t0 = Date.now();
-    const [ra, rb] = await Promise.all([call("prepareDrop", a), call("prepareDrop", b)]);
-    const ms = Date.now() - t0;
-    ra && ra.ok ? ok(`第一个 prepareDrop 成功（两者共耗时 ${ms}ms）`) : bad(`第一个失败：${JSON.stringify(ra)}`);
-    rb && rb.ok ? ok("第二个也成功 —— 排队生效，没有被'忙就拒绝'") : bad(`第二个被拒绝了：${JSON.stringify(rb)}`);
-
-    // 再走一遍点击路径：预填命中时应该几乎不花时间
-    const t1 = Date.now();
-    const rp = await call("pasteFileAsDrop", b);
-    const pasteMs = Date.now() - t1;
-    rp && rp.ok ? ok(`pasteFileAsDrop 成功（${pasteMs}ms${rp.fromCache ? "，命中预填" : ""}）`) : bad(`paste 失败：${JSON.stringify(rp)}`);
-
-    // 失败时不能返回"忙"这种含糊理由
-    const rbad = await call("pasteFileAsDrop", "不存在的文件.gif");
-    rbad && rbad.ok === false && /不存在/.test(rbad.error || "")
-        ? ok("不存在的文件如实报错")
-        : bad(`错误信息不对：${JSON.stringify(rbad)}`);
-
-    try {
-        execSync('taskkill /F /IM cscript.exe', { stdio: "ignore", windowsHide: true });
-    } catch (e) {
-        /* 没有就算了 */
-    }
-}
 
 console.log(`\n================ 结果: ${pass} 通过 / ${fail} 失败 ================`);
 process.exit(fail ? 1 : 0);

@@ -389,26 +389,6 @@ function renderGrid() {
             cell.dataset.anim = "true";
         }
 
-        // 悬停预填：动图在鼠标下停 250ms 就提前把剪贴板准备好（防抖，避免只是划过也起进程）。
-        // 准备一次要 ~860ms，全花在启动进程上；预填之后点下去就是 0 等待。
-        // 跟文件剪贴板路径一起默认关闭 —— 它同样要起外部进程。
-        if (isAnim && config.useFileDrop === true) {
-            let hoverTimer = null;
-            cell.addEventListener("mouseenter", () => {
-                clearTimeout(hoverTimer);
-                hoverTimer = setTimeout(() => {
-                    api.prepareDrop(item.name)
-                        .then((r) => {
-                            if (r && r.ok) log(`已预填剪贴板: ${item.name}${r.cached ? "（命中缓存）" : ""}`);
-                        })
-                        .catch(() => {
-                            /* 预填失败不影响点击时的正常流程 */
-                        });
-                }, 250);
-            });
-            cell.addEventListener("mouseleave", () => clearTimeout(hoverTimer));
-        }
-
         cell.addEventListener("click", () => insertSticker(item));
 
         // 拖动 = 把真实文件交给 QQ（QQ 收到的是货真价实的文件拖放），
@@ -598,36 +578,6 @@ async function insertSticker(item) {
     try {
         let before = editor.innerHTML.length;
         editor.focus();
-
-        // ---------- 动图：文件剪贴板路径（默认关闭） ----------
-        //
-        // 这条路能让 QQ 把图片当**文件**上传，从而保留动画。原理有两层：
-        //   1. "剪贴板里有一个文件"在 Windows 上就是 CF_HDROP，而 Electron 写不了它
-        //      （writeBuffer 里的名字会被注册成同名自定义格式，实测 atom 49902 而不是
-        //      预定义的 15）；
-        //   2. 光有 CF_HDROP 还不够 —— 资源管理器 Ctrl+C 会写 13 种格式（多出
-        //      FileGroupDescriptorW、Preferred DropEffect 等），QQ 只认后者。
-        // 所以只能借 Shell 的 copy 动词，代价是要起一个外部进程（cscript）。
-        //
-        // 【为什么默认关闭】实测会导致 QQ 在**发送之后**卡死：界面无法交互、
-        // 从托盘也退不掉，只能任务管理器。它要在系统剪贴板里放 13 种格式、
-        // 还依赖外部进程持有这些数据，对系统的侵入性太大，不划算。
-        //
-        // 想试的话把 config.json 的 useFileDrop 改成 true；需要保留动画时，
-        // 把文件直接拖进输入框是可靠的做法。
-        const isAnim = item.animated === true || /\.(gif|webp|apng)$/i.test(item.name);
-        if (isAnim && config.useFileDrop === true) {
-            const t0 = Date.now();
-            const dropRes = await api.pasteFileAsDrop(item.name);
-            log(`CF_HDROP 方式返回（${Date.now() - t0}ms）: ` + JSON.stringify(dropRes));
-            if (dropRes && dropRes.ok && (await waitForEditorChange(editor, before, 2000))) {
-                log("动图已按文件填入（QQ 走原文件上传，动画保留）");
-                if (config.closeAfterInsert) closePanel();
-                return;
-            }
-            log("CF_HDROP 方式没让输入框变化，回退到静态首帧");
-            before = editor.innerHTML.length;
-        }
 
         let r = await api.pasteFile(item.name);
         log("真实粘贴返回: " + JSON.stringify(r));
