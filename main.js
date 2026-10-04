@@ -129,31 +129,90 @@ function clipValue(v) {
     return `${s.slice(0, LOG_MAX_VALUE)}…[${tag}已截断，原长 ${s.length} 字符]`;
 }
 
+/**
+ * 日志流。
+ *
+ * 【为什么不能再用 appendFileSync】实测出现过主进程被**完全冻结 290~340 秒**的情况：
+ * 日志里出现整段空白（连每 30 秒一条的内存报告都断了），Windows 事件日志同时记下
+ * 「QQ.exe 停止与 Windows 交互」（Application Hang）。而每次冻结前的最后一条日志都是
+ * 看门狗的内存报告 —— 说明卡死就发生在"写入"这一步本身。
+ *
+ * 同步写会一直等文件系统返回，而文件系统后面还挂着杀软的过滤驱动（用户装了火绒），
+ * 扫描一个刚被写入的文件要多久完全不可控。改成流之后，write() 只把数据放进内存缓冲
+ * 就返回，主线程不再等磁盘。
+ *
+ * 代价：进程被强杀时可能丢掉最后几行日志。相比"整个 QQ 冻结五分钟"，这个代价值得。
+ */
+let logStream = null;
+let logStreamBroken = false;
+
+function ensureLogStream() {
+    if (logStream) return logStream;
+    if (logStreamBroken) return null;
+    try {
+        // pluginRoot 在 onLoad 里的 ensureDirs() 已经建好了，这里不再做同步 mkdir
+        logStream = fs.createWriteStream(logPath, { flags: "a", encoding: "utf8" });
+        logStream.on("error", (err) => {
+            // 这里不能调 log()，会递归
+            logStreamBroken = true;
+            logStream = null;
+            console.error("[sticker_box] 日志流错误: " + String(err));
+        });
+        return logStream;
+    } catch (e) {
+        logStreamBroken = true;
+        logStream = null;
+        return null;
+    }
+}
+
 function log(...args) {
     if (!config.debugLog) return;
     try {
-        fs.mkdirSync(pluginRoot, { recursive: true });
-        // 轮转检查原本每行都要 existsSync + statSync（两次系统调用），
-        // 日志一多就是在主进程同步做无用功。改成最多 5 秒查一次。
-        const now = Date.now();
-        if (now - lastRotationCheck > 5000) {
-            lastRotationCheck = now;
-            try {
-                if (fs.existsSync(logPath) && fs.statSync(logPath).size > 512 * 1024) {
-                    fs.renameSync(logPath, logPath + ".old");
-                }
-            } catch (e) {
-                /* ignore */
-            }
-        }
         let line = `[${new Date().toISOString()}] ${args.map(clipValue).join(" ")}\n`;
         if (line.length > LOG_MAX_LINE) {
             line = `${line.slice(0, LOG_MAX_LINE)}…[整行超长已截断，原长 ${line.length} 字符]\n`;
         }
-        fs.appendFileSync(logPath, line, "utf8");
+        const s = ensureLogStream();
+        // stream.write 是异步的：只进内存缓冲，不等磁盘
+        if (s) s.write(line);
+        scheduleRotationCheck();
     } catch (e) {
         /* 日志失败不能影响主流程 */
     }
+}
+
+/**
+ * 日志轮转。同样全部异步 —— 同步的 statSync/renameSync 一样会卡在文件系统上。
+ * 最多 5 秒查一次，避免每行都做系统调用。
+ */
+function scheduleRotationCheck() {
+    const now = Date.now();
+    if (now - lastRotationCheck < 5000) return;
+    lastRotationCheck = now;
+    fs.promises
+        .stat(logPath)
+        .then((st) => {
+            if (st.size <= 512 * 1024) return;
+            const old = logStream;
+            logStream = null;
+            const afterClose = () =>
+                fs.promises
+                    .rename(logPath, logPath + ".old")
+                    .catch(() => {
+                        /* 重命名失败就算了，下个周期再试 */
+                    });
+            if (old) {
+                old.end(() => {
+                    afterClose();
+                });
+            } else {
+                afterClose();
+            }
+        })
+        .catch(() => {
+            /* 文件还不存在等情况，忽略 */
+        });
 }
 
 // ============================================================ 主进程看门狗
@@ -557,7 +616,18 @@ async function saveCandidates(payload) {
  * 这些名字来自 `appimg://.../Ori/<hash>_0.jpg`，QQ 只管存不管后缀。
  * 光看扩展名判断动图，用户新加的动图就永远走不到「按文件填入」那条路。
  */
-function sniffKind(file) {
+const kindCache = new Map(); // "名字|mtime|大小" → kind
+const KIND_CACHE_MAX = 2000;
+
+function sniffKind(file, cacheKey) {
+    // 缓存很关键：面板每次刷新都会对库里每个文件调一次，而每次是 open+read+close
+    // 三次**同步**系统调用 —— 和日志同步写一样，这些调用会等在文件系统
+    //（以及杀软的过滤驱动）上。
+    if (cacheKey) {
+        const hit = kindCache.get(cacheKey);
+        if (hit) return hit;
+    }
+    let kind = "unknown";
     try {
         const fd = fs.openSync(file, "r");
         // 读 4KB：APNG 的 acTL 块可能不在最开头，多读一点才稳
@@ -565,20 +635,26 @@ function sniffKind(file) {
         const n = fs.readSync(fd, head, 0, 4096, 0);
         fs.closeSync(fd);
         const b = head.subarray(0, n);
-        if (b.length < 12) return "unknown";
-        if (b[0] === 0x47 && b[1] === 0x49 && b[2] === 0x46) return "gif";
-        if (b[0] === 0x89 && b[1] === 0x50 && b[2] === 0x4e && b[3] === 0x47) {
-            // APNG 是 PNG 容器里多一个 acTL 块（QQ 的系统表情就是 apng 伪装成 .png）
-            return b.includes(Buffer.from("acTL", "ascii")) ? "apng" : "png";
+        if (b.length >= 12) {
+            if (b[0] === 0x47 && b[1] === 0x49 && b[2] === 0x46) {
+                kind = "gif";
+            } else if (b[0] === 0x89 && b[1] === 0x50 && b[2] === 0x4e && b[3] === 0x47) {
+                // APNG 是 PNG 容器里多一个 acTL 块（QQ 的系统表情就是 apng 伪装成 .png）
+                kind = b.includes(Buffer.from("acTL", "ascii")) ? "apng" : "png";
+            } else if (b[0] === 0xff && b[1] === 0xd8 && b[2] === 0xff) {
+                kind = "jpeg";
+            } else if (b.subarray(0, 4).toString("ascii") === "RIFF" && b.subarray(8, 12).toString("ascii") === "WEBP") {
+                kind = "webp";
+            }
         }
-        if (b[0] === 0xff && b[1] === 0xd8 && b[2] === 0xff) return "jpeg";
-        if (b.subarray(0, 4).toString("ascii") === "RIFF" && b.subarray(8, 12).toString("ascii") === "WEBP") {
-            return "webp";
-        }
-        return "unknown";
     } catch (e) {
-        return "unknown";
+        /* 读不到就当未知 */
     }
+    if (cacheKey) {
+        if (kindCache.size >= KIND_CACHE_MAX) kindCache.clear();
+        kindCache.set(cacheKey, kind);
+    }
+    return kind;
 }
 
 /** 这个类型能不能动？webp 有可能是静态的，但按动图处理没坏处（走文件上传而已） */
@@ -608,7 +684,7 @@ function listItems(query) {
             continue;
         }
         // 真实类型按内容判断，不看扩展名（QQ 给的缓存文件名后缀经常是错的）
-        const kind = sniffKind(full);
+        const kind = sniffKind(full, `${name}|${st.mtimeMs}|${st.size}`);
         items.push({
             name,
             size: st.size,
@@ -1085,6 +1161,20 @@ function onLoad() {
     }
 
     startWatchdog();
+
+    // 日志是流式异步写的，退出前给它一次 flush 的机会。
+    // （异步写的代价就是强杀时可能丢最后几行，这里尽量兜一下。）
+    try {
+        app.on("will-quit", () => {
+            try {
+                if (logStream) logStream.end();
+            } catch (e) {
+                /* ignore */
+            }
+        });
+    } catch (e) {
+        /* ignore */
+    }
 }
 
 onLoad();
